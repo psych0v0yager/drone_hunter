@@ -189,6 +189,91 @@ This model is **deployment-ready** - no ground truth labels required.
 
 ---
 
+## oracle_no_kamikaze_v2 (Full Cleanup)
+
+**Date**: 2026-01-03
+**Status**: SUCCESS - Best performance yet without ground truth!
+
+### Purpose
+
+Complete removal of `is_kamikaze` from all agent-visible features, including:
+- Target observation (already done in v1)
+- `threat_level` computation (now uses `vz < 0`)
+- Multi-drone observation (22 → 21 features)
+
+### Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Mode | Single-target |
+| Observation normalization | Disabled |
+| Network architecture | 64x64 MLP (ReLU) |
+| Total timesteps | 500,000 |
+| Parallel envs | 4 |
+| Input features | 19 (target) + 5 (game_state) = 24 |
+| is_kamikaze | **FULLY REMOVED** |
+
+### Changes from v1
+
+1. `threat_level` now uses `vz < 0` instead of `is_kamikaze`
+2. Multi-drone observation also updated (for consistency)
+3. Added `has_approaching_threat` property
+
+### Results
+
+| Metric | Value |
+|--------|-------|
+| Best eval reward | **+80.9** (at 460k steps) |
+| Final eval reward | +77.2 ± 26.4 |
+| Episode length | 916 frames (1000 at peak) |
+| Convergence | ~250k steps |
+
+### Training Progression
+
+| Steps | Eval Reward | Episode Length |
+|-------|-------------|----------------|
+| 100k | -4.3 | 232 |
+| 150k | +5.8 | 450 |
+| 190k | +26.0 | 712 |
+| 250k | +40.5 | 810 |
+| 270k | +52.5 | 850 |
+| 330k | +55.7 | 892 |
+| 380k | +59.7 | 858 |
+| 420k | +72.5 | 946 |
+| 460k | **+80.9** | 1000 (full!) |
+| 500k | +77.2 | 916 |
+
+### Key Finding: is_kamikaze May Have Been Harmful
+
+| Run | Best Reward | is_kamikaze | threat_level |
+|-----|-------------|-------------|--------------|
+| oracle_single_target_v1 | +82.2 | Yes | Uses is_kamikaze |
+| oracle_no_kamikaze_v1 | +62.2 | Removed from obs | Still uses is_kamikaze |
+| oracle_no_kamikaze_v2 | **+80.9** | **Fully removed** | Uses vz < 0 |
+
+**Conclusion**: The `is_kamikaze` ground truth label may have actually been a *confounding signal*. When we fully removed it (including from `threat_level`), performance returned to baseline levels. The agent learns threat purely from velocity, which is the correct inductive bias for real-world deployment.
+
+### Model Location
+
+```
+runs/oracle_no_kamikaze_v2/
+├── final_model/
+├── best_model/
+├── checkpoints/
+├── tensorboard/
+└── eval_logs/
+```
+
+### Visualization Command
+
+```bash
+uv run python -m drone_hunter.scripts.evaluate \
+  runs/oracle_no_kamikaze_v2/final_model/model.zip \
+  --single-target --episodes 5 --fps 15
+```
+
+---
+
 ## Future Experiments
 
 ### Planned Ablations

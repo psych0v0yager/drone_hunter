@@ -184,16 +184,18 @@ class GameState:
 
     @property
     def threat_level(self) -> float:
-        """Threat level based on kamikaze proximity (0-1).
+        """Threat level based on approaching drone proximity (0-1).
 
-        Uses depth (z) as primary measure - closer to camera = higher threat.
+        Uses depth (z) and velocity (vz) - approaching drones (vz < 0) that are
+        closer to camera = higher threat. Agent infers threat from observable
+        behavior, not ground truth labels.
         """
         if not self.drones:
             return 0.0
 
         max_threat = 0.0
         for drone in self.drones:
-            if drone.is_kamikaze:
+            if drone.vz < 0:  # Approaching camera
                 # Threat based on depth (z): lower z = closer = higher threat
                 # z=1.0 (far) -> threat=0, z=0.1 (impact) -> threat=1.0
                 threat = 1.0 - drone.z
@@ -202,8 +204,13 @@ class GameState:
         return max(0.0, min(1.0, max_threat))
 
     @property
+    def has_approaching_threat(self) -> bool:
+        """Check if there's an approaching drone (potential threat)."""
+        return any(d.vz < 0 for d in self.drones)
+
+    @property
     def has_kamikaze_threat(self) -> bool:
-        """Check if there's an active kamikaze drone."""
+        """Check if there's an active kamikaze drone (internal use only)."""
         return any(d.is_kamikaze for d in self.drones)
 
     def spawn_drone(self) -> Drone | None:
@@ -418,15 +425,17 @@ class GameState:
         """Get ground-truth observation for oracle mode training.
 
         Returns observation dict with perfect drone positions AND grid cell info.
-        Each drone: (x, y, z, is_kamikaze, vz, urgency, grid_x_onehot[8], grid_y_onehot[8])
+        Each drone: (x, y, z, vz, urgency, grid_x_onehot[8], grid_y_onehot[8])
+
+        Note: is_kamikaze removed - agent infers threat from vz (approaching = negative)
 
         Key insight: Include grid cell as one-hot so agent doesn't need to learn
         the coordinate-to-action mapping from scratch.
         """
         import numpy as np
 
-        # Features per drone: 6 scalar + 8 grid_x one-hot + 8 grid_y one-hot = 22
-        features_per_drone = 6 + grid_size * 2
+        # Features per drone: 5 scalar + 8 grid_x one-hot + 8 grid_y one-hot = 21
+        features_per_drone = 5 + grid_size * 2
         drone_obs = np.zeros((max_drones, features_per_drone), dtype=np.float32)
 
         for i, drone in enumerate(self.drones[:max_drones]):
@@ -434,28 +443,27 @@ class GameState:
             grid_x = min(grid_size - 1, max(0, int(drone.x * grid_size)))
             grid_y = min(grid_size - 1, max(0, int(drone.y * grid_size)))
 
-            # Urgency: how soon will this drone impact? (for kamikazes)
+            # Urgency: how soon will this drone impact? (for approaching drones)
             # Higher urgency = closer to impact (lower z, negative vz)
-            if drone.is_kamikaze:
-                # Frames until impact: z / abs(vz), normalized
+            # Agent infers threat from vz, not ground truth labels
+            if drone.vz < 0:  # Approaching
                 frames_to_impact = drone.z / max(0.001, abs(drone.vz))
                 urgency = 1.0 / (1.0 + frames_to_impact / 50.0)  # Sigmoid-ish
             else:
-                urgency = 0.0
+                urgency = 0.1  # Low urgency for non-approaching
 
-            # Scalar features
+            # Scalar features (no is_kamikaze - agent learns from vz + rewards)
             drone_obs[i, 0] = drone.x
             drone_obs[i, 1] = drone.y
             drone_obs[i, 2] = drone.z
-            drone_obs[i, 3] = 1.0 if drone.is_kamikaze else 0.0
-            drone_obs[i, 4] = drone.vz * 10  # Scale for gradient
-            drone_obs[i, 5] = urgency
+            drone_obs[i, 3] = drone.vz * 10  # Scale for gradient
+            drone_obs[i, 4] = urgency
 
-            # One-hot grid_x (positions 6-13)
-            drone_obs[i, 6 + grid_x] = 1.0
+            # One-hot grid_x (positions 5-12)
+            drone_obs[i, 5 + grid_x] = 1.0
 
-            # One-hot grid_y (positions 14-21)
-            drone_obs[i, 6 + grid_size + grid_y] = 1.0
+            # One-hot grid_y (positions 13-20)
+            drone_obs[i, 5 + grid_size + grid_y] = 1.0
 
         # Game state: (ammo_frac, reload_frac, frame_frac, threat_level, n_drones_normalized)
         game_state_obs = np.array([

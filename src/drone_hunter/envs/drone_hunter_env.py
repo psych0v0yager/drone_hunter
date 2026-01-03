@@ -121,7 +121,9 @@ class DroneHunterEnv(gym.Env):
             })
         else:
             # Multi-drone mode (original)
-            features_per_drone = 6 + grid_size * 2  # 22 for 8x8 grid
+            # Features: x, y, z, vz, urgency, grid_x_onehot[8], grid_y_onehot[8]
+            # Note: is_kamikaze removed - agent infers threat from vz
+            features_per_drone = 5 + grid_size * 2  # 21 for 8x8 grid
             self.observation_space = spaces.Dict({
                 "detections": spaces.Box(
                     low=-1.0,
