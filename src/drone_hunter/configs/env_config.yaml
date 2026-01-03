@@ -1,0 +1,58 @@
+# Drone Hunter Environment Configuration
+
+# Display
+display:
+  width: 320
+  height: 320
+  fps: 30
+
+# Game mechanics
+game:
+  max_frames: 1000
+  grid_size: 8
+
+  # Ammo system
+  clip_size: 10
+  reload_time: 30  # frames
+
+  # Drone spawning
+  base_spawn_rate: 0.05
+  spawn_rate_increase: 0.00005
+
+  # Drone type probabilities
+  normal_prob: 0.70
+  kamikaze_prob: 0.20
+  erratic_prob: 0.10
+
+# Observation
+observation:
+  max_drones: 10
+  frame_stack: 4
+  oracle_mode: true  # Use ground truth, not detector
+
+# Rewards
+rewards:
+  hit_normal: 1.0
+  hit_kamikaze: 2.0
+  miss_penalty: -0.1
+  kamikaze_impact: -5.0
+  survival_per_frame: 0.01
+  empty_during_threat: -0.5
+  episode_complete: 3.0
+
+# Domain randomization (renderer)
+augmentation:
+  brightness: true
+  contrast: true
+  motion_blur: true
+
+# PPO training defaults
+ppo:
+  learning_rate: 0.0003
+  n_steps: 2048
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01

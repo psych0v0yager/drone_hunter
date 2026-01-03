@@ -1,0 +1,28 @@
+[project]
+name = "drone-hunter"
+version = "0.1.0"
+description = "RL environment for training drone detection and engagement policies"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gymnasium>=1.2.3",
+    "numpy>=2.4.0",
+    "opencv-python>=4.11.0.86",
+    "pillow>=12.1.0",
+    "pyyaml>=6.0.3",
+    "rich>=14.2.0",
+    "stable-baselines3>=2.7.1",
+    "tensorboard>=2.20.0",
+    "torch>=2.9.1",
+    "tqdm>=4.67.1",
+]
+
+[project.optional-dependencies]
+opencv = ["opencv-python>=4.8.0"]
+
+[project.scripts]
+drone-hunter-play = "drone_hunter.scripts.play:main"
+drone-hunter-train = "drone_hunter.scripts.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
