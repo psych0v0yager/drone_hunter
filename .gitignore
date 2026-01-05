@@ -12,6 +12,9 @@ wheels/
 # Training runs (large model files)
 runs/
 
+# Large datasets
+data/drone_detection_v2/
+
 # Temporary files
 *.tmp
 *.log
