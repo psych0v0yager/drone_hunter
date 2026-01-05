@@ -45,6 +45,7 @@ def run_live(
     grid_size: int = 8,
     display_scale: int = 2,
     target_fps: int = 30,
+    detect_interval: int = 1,
 ) -> None:
     """Run the drone hunter simulation with live display.
 
@@ -58,6 +59,7 @@ def run_live(
         grid_size: Size of firing grid.
         display_scale: Scale factor for display window.
         target_fps: Target frames per second.
+        detect_interval: Run detector every N frames (1=every frame, 2=skip one, etc).
     """
     # Initialize components
     game_state = GameState(max_frames=max_frames)
@@ -128,6 +130,8 @@ def run_live(
     print("  R     - Reset episode")
     print("  Q/ESC - Quit")
     print(f"\nTarget FPS: {target_fps}")
+    if detect_interval > 1:
+        print(f"Detection interval: every {detect_interval} frames (frame skipping enabled)")
 
     while running:
         episode += 1
@@ -170,22 +174,28 @@ def run_live(
             frame = renderer.render(game_state)
             t_render = time.perf_counter() - t0
 
-            # Get detections
+            # Get detections (with optional frame skipping)
             t0 = time.perf_counter()
-            if oracle_mode or detector is None:
-                detections = [
-                    Detection(
-                        x=d.x,
-                        y=d.y,
-                        w=d.size,
-                        h=d.size,
-                        confidence=1.0,
-                    )
-                    for d in game_state.drones
-                    if d.is_on_screen()
-                ]
+            run_detection = (step % detect_interval == 0) or oracle_mode or detector is None
+
+            if run_detection:
+                if oracle_mode or detector is None:
+                    detections = [
+                        Detection(
+                            x=d.x,
+                            y=d.y,
+                            w=d.size,
+                            h=d.size,
+                            confidence=1.0,
+                        )
+                        for d in game_state.drones
+                        if d.is_on_screen()
+                    ]
+                else:
+                    detections = detector.detect(frame)
             else:
-                detections = detector.detect(frame)
+                # Skip detection, use empty list (tracker will predict)
+                detections = []
             t_detect = time.perf_counter() - t0
 
             # Update tracker
@@ -365,6 +375,11 @@ def main():
         "--fps", type=int, default=30,
         help="Target frames per second"
     )
+    parser.add_argument(
+        "--detect-interval", type=int, default=1,
+        help="Run detector every N frames (1=every frame, 3=skip 2, etc). "
+             "Higher values improve FPS but reduce detection accuracy."
+    )
 
     args = parser.parse_args()
 
@@ -378,6 +393,7 @@ def main():
         grid_size=args.grid_size,
         display_scale=args.scale,
         target_fps=args.fps,
+        detect_interval=args.detect_interval,
     )
 
 
