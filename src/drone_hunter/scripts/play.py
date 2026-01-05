@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -35,6 +36,7 @@ class HumanPlayer:
         height: int = 640,
         max_frames: int = 1000,
         fps: int = 30,
+        difficulty: str | None = None,
     ):
         """Initialize human player interface.
 
@@ -44,6 +46,7 @@ class HumanPlayer:
             height: Display height.
             max_frames: Maximum frames per episode.
             fps: Target frames per second.
+            difficulty: Visual difficulty preset (easy, medium, hard, forest, urban).
         """
         if not HAS_OPENCV:
             raise ImportError(
@@ -65,6 +68,7 @@ class HumanPlayer:
             height=height,
             max_frames=max_frames,
             oracle_mode=True,
+            difficulty=difficulty,
         )
 
         # State
@@ -197,6 +201,9 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=640, help="Display height")
     parser.add_argument("--fps", type=int, default=30, help="Target FPS")
     parser.add_argument("--max-frames", type=int, default=1000, help="Max frames per episode")
+    parser.add_argument("--difficulty", type=str, default=None,
+                       choices=["easy", "medium", "hard", "forest", "urban"],
+                       help="Visual difficulty preset")
 
     args = parser.parse_args()
 
@@ -207,6 +214,7 @@ def main() -> None:
             height=args.height,
             fps=args.fps,
             max_frames=args.max_frames,
+            difficulty=args.difficulty,
         )
         player.run()
     except ImportError as e:

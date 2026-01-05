@@ -16,6 +16,94 @@ class DroneType(Enum):
     ERRATIC = auto()   # Zigzag pattern
 
 
+class DistractorType(Enum):
+    """Types of flying distractors (non-target objects)."""
+    BIRD = auto()      # Small, erratic, flapping silhouette
+    DEBRIS = auto()    # Tiny, falling/wind-blown speck
+    BALLOON = auto()   # Medium, slow rising drift
+    PLANE = auto()     # Large, linear, high altitude
+
+
+class StaticObstacleType(Enum):
+    """Types of static obstacles in the scene."""
+    TREE = auto()      # Tree silhouette at bottom/edges
+    POWERLINE = auto() # Horizontal lines across frame
+
+
+@dataclass
+class Distractor:
+    """Flying non-target object that can cause detector false positives.
+
+    Distractors look like potential drones to the detector but should not be
+    shot at. They test the detector's ability to distinguish drones from other
+    flying objects.
+    """
+    x: float                        # Horizontal position (0-1)
+    y: float                        # Vertical position (0-1)
+    z: float                        # Depth (1.0 = far, 0.0 = close)
+    vx: float                       # Horizontal velocity
+    vy: float                       # Vertical velocity
+    vz: float                       # Depth velocity
+    distractor_type: DistractorType
+    base_size: float                # Base size at z=0.5
+    age: int = 0                    # Frames since spawn
+
+    @property
+    def size(self) -> float:
+        """Get apparent size based on depth."""
+        z_clamped = max(0.1, min(1.0, self.z))
+        return self.base_size * (0.5 / z_clamped)
+
+    def update(self) -> None:
+        """Update distractor position and apply type-specific behavior."""
+        self.x += self.vx
+        self.y += self.vy
+        self.z += self.vz
+        self.age += 1
+
+        # Birds have erratic flapping movement
+        if self.distractor_type == DistractorType.BIRD and self.age % 8 == 0:
+            self.vx += random.uniform(-0.004, 0.004)
+            self.vy += random.uniform(-0.003, 0.003)
+
+        # Debris tumbles in wind
+        if self.distractor_type == DistractorType.DEBRIS and self.age % 5 == 0:
+            self.vx += random.uniform(-0.002, 0.002)
+
+        # Balloons drift slowly upward
+        if self.distractor_type == DistractorType.BALLOON:
+            self.vy -= 0.0002  # Slight upward drift
+
+    def is_on_screen(self, margin: float = 0.15) -> bool:
+        """Check if distractor is within screen bounds."""
+        return (
+            -margin <= self.x <= 1 + margin and
+            -margin <= self.y <= 1 + margin and
+            self.z > 0.05
+        )
+
+
+@dataclass
+class StaticObstacle:
+    """Static scene obstacle for visual complexity and occlusion.
+
+    Static obstacles don't move but add visual noise that can confuse the
+    detector (trees can look like drones) or occlude actual drones.
+    """
+    obstacle_type: StaticObstacleType
+    x: float                        # Position (normalized)
+    y: float
+    width: float                    # Size
+    height: float
+    sway_offset: float = 0.0        # For tree swaying animation
+    sway_speed: float = 0.0         # Speed of sway
+
+    def update(self) -> None:
+        """Update obstacle animation (e.g., tree sway)."""
+        if self.obstacle_type == StaticObstacleType.TREE and self.sway_speed > 0:
+            self.sway_offset = math.sin(self.sway_offset + self.sway_speed) * 0.01
+
+
 @dataclass
 class Drone:
     """Represents a single drone in the game.
@@ -127,6 +215,21 @@ class GameState:
 
     # Drones currently in play
     drones: List[Drone] = field(default_factory=list)
+
+    # Distractors (visual confusion for detector)
+    distractors: List[Distractor] = field(default_factory=list)
+
+    # Static obstacles (occlusion and visual noise)
+    static_obstacles: List[StaticObstacle] = field(default_factory=list)
+
+    # Distractor settings (set from DifficultyConfig)
+    distractors_enabled: bool = False
+    distractor_spawn_rate: float = 0.02
+    distractor_types: List[str] = field(default_factory=lambda: ["bird", "debris"])
+
+    # Static obstacle settings
+    static_obstacles_enabled: bool = False
+    static_obstacle_types: List[str] = field(default_factory=list)
 
     # Ammo system
     ammo: int = 10
@@ -300,6 +403,127 @@ class GameState:
         self.drones.append(drone)
         return drone
 
+    def spawn_distractor(self) -> Distractor | None:
+        """Attempt to spawn a flying distractor based on settings."""
+        if not self.distractors_enabled:
+            return None
+
+        if random.random() > self.distractor_spawn_rate:
+            return None
+
+        if not self.distractor_types:
+            return None
+
+        # Pick random distractor type from enabled types
+        type_name = random.choice(self.distractor_types)
+        type_map = {
+            "bird": DistractorType.BIRD,
+            "debris": DistractorType.DEBRIS,
+            "balloon": DistractorType.BALLOON,
+            "plane": DistractorType.PLANE,
+        }
+        distractor_type = type_map.get(type_name, DistractorType.BIRD)
+
+        # Spawn from edges
+        edge = random.randint(0, 3)
+
+        if edge == 0:  # Top
+            x = random.uniform(0.0, 1.0)
+            y = -0.1
+        elif edge == 1:  # Right
+            x = 1.1
+            y = random.uniform(0.0, 1.0)
+        elif edge == 2:  # Bottom
+            x = random.uniform(0.0, 1.0)
+            y = 1.1
+        else:  # Left
+            x = -0.1
+            y = random.uniform(0.0, 1.0)
+
+        z = random.uniform(0.5, 1.0)
+
+        # Velocity based on type
+        if distractor_type == DistractorType.BIRD:
+            speed = random.uniform(0.008, 0.015)
+            base_size = random.uniform(0.02, 0.04)
+        elif distractor_type == DistractorType.DEBRIS:
+            speed = random.uniform(0.003, 0.008)
+            base_size = random.uniform(0.01, 0.02)
+        elif distractor_type == DistractorType.BALLOON:
+            speed = random.uniform(0.002, 0.005)
+            base_size = random.uniform(0.03, 0.06)
+        elif distractor_type == DistractorType.PLANE:
+            speed = random.uniform(0.015, 0.025)
+            base_size = random.uniform(0.06, 0.10)
+        else:
+            speed = random.uniform(0.005, 0.010)
+            base_size = random.uniform(0.02, 0.04)
+
+        # Direction toward opposite side
+        target_x = random.uniform(0.2, 0.8)
+        target_y = random.uniform(0.2, 0.8)
+        dx = target_x - x
+        dy = target_y - y
+        dist = math.sqrt(dx * dx + dy * dy) or 1.0
+        vx = (dx / dist) * speed
+        vy = (dy / dist) * speed
+        vz = random.uniform(-0.003, 0.003)
+
+        distractor = Distractor(
+            x=x,
+            y=y,
+            z=z,
+            vx=vx,
+            vy=vy,
+            vz=vz,
+            distractor_type=distractor_type,
+            base_size=base_size,
+        )
+
+        self.distractors.append(distractor)
+        return distractor
+
+    def update_distractors(self) -> None:
+        """Update all distractors and remove off-screen ones."""
+        remaining = []
+        for distractor in self.distractors:
+            distractor.update()
+            if distractor.is_on_screen():
+                remaining.append(distractor)
+        self.distractors = remaining
+
+    def generate_static_obstacles(self) -> None:
+        """Generate static obstacles based on settings (called at reset)."""
+        self.static_obstacles.clear()
+
+        if not self.static_obstacles_enabled:
+            return
+
+        if "tree" in self.static_obstacle_types:
+            # Add 2-4 trees at bottom
+            num_trees = random.randint(2, 4)
+            for _ in range(num_trees):
+                self.static_obstacles.append(StaticObstacle(
+                    obstacle_type=StaticObstacleType.TREE,
+                    x=random.uniform(0.05, 0.95),
+                    y=random.uniform(0.75, 0.95),
+                    width=random.uniform(0.08, 0.15),
+                    height=random.uniform(0.15, 0.30),
+                    sway_speed=random.uniform(0.02, 0.05),
+                ))
+
+        if "powerline" in self.static_obstacle_types:
+            # Add 1-2 horizontal powerlines
+            num_lines = random.randint(1, 2)
+            for i in range(num_lines):
+                self.static_obstacles.append(StaticObstacle(
+                    obstacle_type=StaticObstacleType.POWERLINE,
+                    x=0.0,
+                    y=random.uniform(0.25 + i * 0.3, 0.45 + i * 0.3),
+                    width=1.0,
+                    height=0.01,
+                ))
+
     def update_drones(self) -> List[Drone]:
         """Update all drones and remove off-screen ones.
 
@@ -402,6 +626,14 @@ class GameState:
         self.update_drones()
         self.spawn_drone()
 
+        # Update distractors (visual-only, no game impact)
+        self.update_distractors()
+        self.spawn_distractor()
+
+        # Update static obstacle animations
+        for obstacle in self.static_obstacles:
+            obstacle.update()
+
         # Check for episode end
         if self.frame_count >= self.max_frames:
             self.game_over = True
@@ -410,6 +642,8 @@ class GameState:
     def reset(self) -> None:
         """Reset game state for new episode."""
         self.drones.clear()
+        self.distractors.clear()
+        self.generate_static_obstacles()
         self.ammo = self.clip_size
         self.is_reloading = False
         self.reload_timer = 0

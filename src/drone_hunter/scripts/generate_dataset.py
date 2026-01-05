@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 from tqdm import tqdm
 
+from drone_hunter.envs.difficulty import DifficultyConfig
 from drone_hunter.envs.game_state import Drone, DroneType, GameState
 from drone_hunter.envs.renderer import SpriteRenderer
 
@@ -108,6 +109,7 @@ def generate_frame(
     renderer: SpriteRenderer,
     num_drones: int,
     game_state: GameState,
+    vary_conditions: bool = False,
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
     """Generate a single frame with random drones.
 
@@ -115,11 +117,22 @@ def generate_frame(
         renderer: Sprite renderer instance.
         num_drones: Number of drones to render.
         game_state: Game state to populate with drones.
+        vary_conditions: If True, randomly vary lighting/scene each frame.
 
     Returns:
         Tuple of (frame_rgb, annotations) where annotations is list of
         dicts with 'bbox' and 'area' keys.
+        NOTE: Only drones are annotated, not distractors.
     """
+    # Optionally vary lighting/scene for diversity
+    if vary_conditions and random.random() < 0.3:
+        renderer.reset_background()
+
+    # Handle distractors (spawn and update)
+    if game_state.distractors_enabled:
+        game_state.spawn_distractor()
+        game_state.update_distractors()
+
     # Clear existing drones
     game_state.drones = []
 
@@ -128,10 +141,10 @@ def generate_frame(
         drone = create_random_drone()
         game_state.drones.append(drone)
 
-    # Render frame
+    # Render frame (includes obstacles, distractors, drones, weather, augmentation)
     frame = renderer.render(game_state)
 
-    # Extract annotations
+    # Extract annotations - ONLY for drones, NOT distractors
     annotations = []
     for drone in game_state.drones:
         # Skip drones that are off-screen or too small
@@ -177,6 +190,8 @@ def generate_dataset(
     min_drones: int = 1,
     background_change_freq: int = 50,
     seed: int | None = None,
+    difficulty: str = "easy",
+    mixed_ratios: tuple[float, float, float] | None = None,
 ) -> dict[str, Any]:
     """Generate COCO-format dataset from simulation.
 
@@ -190,6 +205,8 @@ def generate_dataset(
         min_drones: Minimum drones per frame (for non-negative samples).
         background_change_freq: Regenerate background every N frames.
         seed: Random seed for reproducibility.
+        difficulty: Difficulty preset (easy, medium, hard, mixed).
+        mixed_ratios: For 'mixed' mode, tuple of (easy, medium, hard) ratios.
 
     Returns:
         Stats dictionary with generation summary.
@@ -209,10 +226,46 @@ def generate_dataset(
     val_img_dir.mkdir(parents=True, exist_ok=True)
     ann_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize renderer and game state
+    # Set up difficulty configs
+    if difficulty == "mixed":
+        ratios = mixed_ratios or (0.2, 0.3, 0.5)  # Default: 20% easy, 30% medium, 50% hard
+        difficulty_configs = [
+            ("easy", DifficultyConfig.easy(), ratios[0]),
+            ("medium", DifficultyConfig.medium(), ratios[1]),
+            ("hard", DifficultyConfig.hard(), ratios[2]),
+        ]
+        # Pre-compute which difficulty each image uses
+        difficulty_assignments = []
+        for name, config, ratio in difficulty_configs:
+            count = int(num_images * ratio)
+            difficulty_assignments.extend([(name, config)] * count)
+        # Pad to exact num_images if rounding caused mismatch
+        while len(difficulty_assignments) < num_images:
+            difficulty_assignments.append(("hard", DifficultyConfig.hard()))
+        random.shuffle(difficulty_assignments)
+    else:
+        # Single difficulty for all images
+        config = DifficultyConfig.from_name(difficulty)
+        difficulty_assignments = [(difficulty, config)] * num_images
+
+    # Initialize renderer and game state with first config
     width, height = image_size
-    renderer = SpriteRenderer(width=width, height=height)
+    current_difficulty_name, current_config = difficulty_assignments[0]
+    renderer = SpriteRenderer(width=width, height=height, difficulty_config=current_config)
     game_state = GameState()
+
+    # Wire distractor settings to game state
+    def apply_difficulty_to_game_state(config: DifficultyConfig) -> None:
+        game_state.distractors_enabled = config.distractors_enabled
+        game_state.distractor_spawn_rate = config.distractor_spawn_rate
+        game_state.distractor_types = config.distractor_types
+        game_state.static_obstacles_enabled = config.static_obstacles_enabled
+        game_state.static_obstacle_types = config.static_obstacle_types
+        # Clear existing distractors when switching difficulty
+        game_state.distractors = []
+        game_state.generate_static_obstacles()
+
+    apply_difficulty_to_game_state(current_config)
 
     # COCO annotation structures
     categories = [
@@ -246,10 +299,28 @@ def generate_dataset(
 
     print(f"Generating {num_images} images ({num_train} train, {num_images - num_train} val)")
     print(f"Including {num_negatives} negative samples ({negative_ratio:.0%})")
+    print(f"Difficulty: {difficulty}")
+    if difficulty == "mixed":
+        ratios = mixed_ratios or (0.2, 0.3, 0.5)
+        print(f"  Mixed ratios: easy={ratios[0]:.0%}, medium={ratios[1]:.0%}, hard={ratios[2]:.0%}")
+
+    # Track difficulty distribution for stats
+    difficulty_counts = {"easy": 0, "medium": 0, "hard": 0}
 
     for i in tqdm(range(num_images), desc="Generating"):
+        # Get difficulty for this image
+        diff_name, diff_config = difficulty_assignments[i]
+        difficulty_counts[diff_name] = difficulty_counts.get(diff_name, 0) + 1
+
+        # Switch difficulty if changed (for mixed mode)
+        if diff_config is not current_config:
+            current_config = diff_config
+            renderer.difficulty_config = diff_config
+            apply_difficulty_to_game_state(diff_config)
+            renderer.reset_background()
+
         # Regenerate background periodically
-        if i % background_change_freq == 0:
+        elif i % background_change_freq == 0:
             renderer.reset_background()
 
         # Determine number of drones
@@ -258,8 +329,14 @@ def generate_dataset(
         else:
             num_drones = random.randint(min_drones, max_drones)
 
+        # Determine if we should vary conditions (lighting/scene) within this frame
+        # Enable for medium and hard difficulties
+        vary_conditions = diff_name in ("medium", "hard")
+
         # Generate frame and annotations
-        frame, frame_annotations = generate_frame(renderer, num_drones, game_state)
+        frame, frame_annotations = generate_frame(
+            renderer, num_drones, game_state, vary_conditions=vary_conditions
+        )
 
         # Determine train/val split
         is_train = i < num_train
@@ -314,6 +391,8 @@ def generate_dataset(
         "train_annotations": train_annotations,
         "val_annotations": val_annotations,
         "avg_annotations_per_image": total_annotations / num_images,
+        "difficulty": difficulty,
+        "difficulty_distribution": difficulty_counts,
     }
 
     print(f"\nDataset generated at: {output_dir}")
@@ -321,6 +400,7 @@ def generate_dataset(
     print(f"  Val images: {stats['val_images']}")
     print(f"  Total annotations: {stats['total_annotations']}")
     print(f"  Avg per image: {stats['avg_annotations_per_image']:.1f}")
+    print(f"  Difficulty distribution: {difficulty_counts}")
 
     return stats
 
@@ -377,8 +457,31 @@ def main():
         default=None,
         help="Random seed for reproducibility",
     )
+    parser.add_argument(
+        "--difficulty",
+        type=str,
+        choices=["easy", "medium", "hard", "mixed"],
+        default="easy",
+        help="Difficulty preset (default: easy). Use 'mixed' for varied difficulty.",
+    )
+    parser.add_argument(
+        "--mixed-ratios",
+        type=str,
+        default=None,
+        help="For 'mixed' mode: ratios as 'easy:medium:hard' (e.g., '0.2:0.3:0.5')",
+    )
 
     args = parser.parse_args()
+
+    # Parse mixed ratios if provided
+    mixed_ratios = None
+    if args.mixed_ratios:
+        parts = args.mixed_ratios.split(":")
+        if len(parts) != 3:
+            parser.error("--mixed-ratios must be in format 'easy:medium:hard' (e.g., '0.2:0.3:0.5')")
+        mixed_ratios = tuple(float(p) for p in parts)
+        if abs(sum(mixed_ratios) - 1.0) > 0.01:
+            parser.error("--mixed-ratios must sum to 1.0")
 
     generate_dataset(
         output_dir=Path(args.output),
@@ -389,6 +492,8 @@ def main():
         max_drones=args.max_drones,
         min_drones=args.min_drones,
         seed=args.seed,
+        difficulty=args.difficulty,
+        mixed_ratios=mixed_ratios,
     )
 
 

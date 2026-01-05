@@ -9,6 +9,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from drone_hunter.envs.difficulty import DifficultyConfig
 from drone_hunter.envs.game_state import GameState
 from drone_hunter.envs.renderer import SpriteRenderer
 from drone_hunter.tracking import Detection, KalmanTracker
@@ -56,6 +57,7 @@ class DroneHunterEnv(gym.Env):
         detection_dropout: float = 0.05,
         assets_dir: Path | str | None = None,
         detector_model: Path | str | None = None,
+        difficulty: str | DifficultyConfig | None = None,
     ):
         """Initialize Drone Hunter environment.
 
@@ -74,8 +76,19 @@ class DroneHunterEnv(gym.Env):
             assets_dir: Directory containing assets (backgrounds, drones).
             detector_model: Path to ONNX detector model. If provided, uses real
                 detector instead of simulated one (only in detector mode).
+            difficulty: Visual difficulty preset or DifficultyConfig instance.
+                Options: "easy" (default), "medium", "hard", "forest", "urban".
+                Only affects visuals/detector training, not core gameplay.
         """
         super().__init__()
+
+        # Parse difficulty config
+        if difficulty is None:
+            self.difficulty = DifficultyConfig.easy()
+        elif isinstance(difficulty, str):
+            self.difficulty = DifficultyConfig.from_name(difficulty)
+        else:
+            self.difficulty = difficulty
 
         self.render_mode = render_mode
         self.grid_size = grid_size
@@ -94,6 +107,13 @@ class DroneHunterEnv(gym.Env):
         # Initialize game state
         self.game_state = GameState(max_frames=max_frames)
 
+        # Configure distractor settings from difficulty
+        self.game_state.distractors_enabled = self.difficulty.distractors_enabled
+        self.game_state.distractor_spawn_rate = self.difficulty.distractor_spawn_rate
+        self.game_state.distractor_types = list(self.difficulty.distractor_types)
+        self.game_state.static_obstacles_enabled = self.difficulty.static_obstacles_enabled
+        self.game_state.static_obstacle_types = list(self.difficulty.static_obstacle_types)
+
         # Initialize renderer
         assets_path = Path(assets_dir) if assets_dir else None
         backgrounds_dir = assets_path / "backgrounds" if assets_path else None
@@ -104,6 +124,7 @@ class DroneHunterEnv(gym.Env):
             height=height,
             backgrounds_dir=backgrounds_dir,
             drones_dir=drones_dir,
+            difficulty_config=self.difficulty,
         )
 
         # Initialize real detector if model path provided

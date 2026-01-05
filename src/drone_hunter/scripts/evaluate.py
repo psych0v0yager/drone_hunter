@@ -33,6 +33,7 @@ def evaluate(
     detector_model: Path | str | None = None,
     show_gt_boxes: bool = True,
     show_detector_boxes: bool = True,
+    difficulty: str | None = None,
 ) -> dict:
     """Evaluate a trained model.
 
@@ -49,6 +50,7 @@ def evaluate(
         detector_model: Path to ONNX detector model for real detection
         show_gt_boxes: Show ground truth bounding boxes (green/red)
         show_detector_boxes: Show detector predictions (yellow)
+        difficulty: Visual difficulty preset (easy, medium, hard, forest, urban)
 
     Returns:
         Dictionary with evaluation stats
@@ -69,6 +71,7 @@ def evaluate(
             oracle_mode=not detector_mode,
             single_target_mode=single_target_mode,
             detector_model=detector_model,
+            difficulty=difficulty,
         )
 
     env = DummyVecEnv([make_env])
@@ -215,6 +218,9 @@ def main():
                        help="Hide ground truth bounding boxes (green/red)")
     parser.add_argument("--no-detector-boxes", action="store_true",
                        help="Hide detector prediction boxes (yellow)")
+    parser.add_argument("--difficulty", type=str, default=None,
+                       choices=["easy", "medium", "hard", "forest", "urban"],
+                       help="Visual difficulty preset")
 
     args = parser.parse_args()
 
@@ -231,6 +237,7 @@ def main():
         detector_model=args.detector_model,
         show_gt_boxes=not args.no_gt_boxes,
         show_detector_boxes=not args.no_detector_boxes,
+        difficulty=args.difficulty,
     )
 
 

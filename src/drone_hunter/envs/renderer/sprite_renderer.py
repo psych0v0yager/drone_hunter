@@ -20,7 +20,11 @@ from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 from drone_hunter.envs.renderer.base_renderer import BaseRenderer
 
 if TYPE_CHECKING:
-    from drone_hunter.envs.game_state import GameState, Drone
+    from drone_hunter.envs.game_state import (
+        GameState, Drone, Distractor, StaticObstacle,
+        DistractorType, StaticObstacleType
+    )
+    from drone_hunter.envs.difficulty import DifficultyConfig
 
 
 class SpriteRenderer(BaseRenderer):
@@ -38,6 +42,7 @@ class SpriteRenderer(BaseRenderer):
         drones_dir: Path | str | None = None,
         use_placeholders: bool = True,
         force_backend: str | None = None,
+        difficulty_config: DifficultyConfig | None = None,
     ):
         """Initialize sprite renderer.
 
@@ -48,6 +53,7 @@ class SpriteRenderer(BaseRenderer):
             drones_dir: Directory containing drone sprite images.
             use_placeholders: If True, use colored shapes when assets missing.
             force_backend: Force "opencv" or "pillow", or None for auto-detect.
+            difficulty_config: Visual difficulty settings for augmentation.
         """
         super().__init__(width, height)
 
@@ -63,6 +69,12 @@ class SpriteRenderer(BaseRenderer):
         self.drones_dir = Path(drones_dir) if drones_dir else None
         self.use_placeholders = use_placeholders
 
+        # Difficulty configuration (import here to avoid circular imports)
+        if difficulty_config is None:
+            from drone_hunter.envs.difficulty import DifficultyConfig
+            difficulty_config = DifficultyConfig()
+        self.difficulty_config = difficulty_config
+
         # Load assets (stored as numpy arrays for OpenCV compatibility)
         self.backgrounds: list[np.ndarray] = []
         self.drone_sprites: list[np.ndarray] = []  # BGRA format
@@ -75,7 +87,7 @@ class SpriteRenderer(BaseRenderer):
         # Current background (changes between episodes)
         self._current_bg: np.ndarray | None = None
 
-        # Augmentation settings
+        # Augmentation settings (legacy - now controlled by difficulty_config)
         self.augment_brightness = True
         self.augment_contrast = True
         self.motion_blur = True
@@ -178,6 +190,270 @@ class SpriteRenderer(BaseRenderer):
             img = Image.alpha_composite(img.convert("RGBA"), cloud_layer).convert("RGB")
 
         return np.array(img)
+
+    def _generate_sky_for_lighting(self) -> np.ndarray:
+        """Generate sky background based on lighting mode from difficulty config."""
+        mode = self.difficulty_config.lighting_mode
+
+        if mode == "random":
+            mode = random.choice(["day", "golden_hour", "overcast", "dusk", "night"])
+
+        if mode == "day":
+            return self._generate_sky_background()
+
+        elif mode == "golden_hour":
+            return self._generate_golden_hour_sky()
+
+        elif mode == "overcast":
+            return self._generate_overcast_sky()
+
+        elif mode == "dusk":
+            return self._generate_dusk_sky()
+
+        elif mode == "night":
+            return self._generate_night_sky()
+
+        elif mode == "thermal":
+            return self._generate_thermal_background()
+
+        elif mode == "night_vision":
+            return self._generate_night_vision_background()
+
+        # Fallback to day
+        return self._generate_sky_background()
+
+    def _generate_golden_hour_sky(self) -> np.ndarray:
+        """Generate golden hour / sunset sky."""
+        if self.use_opencv:
+            img = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            for y in range(self.height):
+                ratio = y / self.height
+                r = 255
+                g = int(150 + ratio * 50)
+                b = int(80 + ratio * 40)
+                img[y, :] = [r, g, b]
+            # Add golden-tinted clouds
+            return self._add_clouds_cv(img, tint=(255, 200, 150))
+        else:
+            img = Image.new("RGB", (self.width, self.height))
+            draw = ImageDraw.Draw(img)
+            for y in range(self.height):
+                ratio = y / self.height
+                r = 255
+                g = int(150 + ratio * 50)
+                b = int(80 + ratio * 40)
+                draw.line([(0, y), (self.width, y)], fill=(r, g, b))
+            return self._add_clouds_pil(np.array(img), tint=(255, 200, 150))
+
+    def _generate_overcast_sky(self) -> np.ndarray:
+        """Generate flat gray overcast sky."""
+        gray = random.randint(160, 200)
+        return np.full((self.height, self.width, 3), gray, dtype=np.uint8)
+
+    def _generate_dusk_sky(self) -> np.ndarray:
+        """Generate dusk/twilight sky."""
+        if self.use_opencv:
+            img = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            for y in range(self.height):
+                ratio = y / self.height
+                r = int(30 + ratio * 20)
+                g = int(40 + ratio * 30)
+                b = int(80 + ratio * 40)
+                img[y, :] = [r, g, b]
+            return img
+        else:
+            img = Image.new("RGB", (self.width, self.height))
+            draw = ImageDraw.Draw(img)
+            for y in range(self.height):
+                ratio = y / self.height
+                r = int(30 + ratio * 20)
+                g = int(40 + ratio * 30)
+                b = int(80 + ratio * 40)
+                draw.line([(0, y), (self.width, y)], fill=(r, g, b))
+            return np.array(img)
+
+    def _generate_night_sky(self) -> np.ndarray:
+        """Generate night sky with stars."""
+        img = np.full((self.height, self.width, 3), 15, dtype=np.uint8)
+        # Add stars in upper portion
+        for _ in range(50):
+            x = random.randint(0, self.width - 1)
+            y = random.randint(0, self.height // 2)
+            brightness = random.randint(150, 255)
+            img[y, x] = [brightness, brightness, brightness]
+        return img
+
+    def _generate_thermal_background(self) -> np.ndarray:
+        """Generate thermal imaging background (dark grayscale)."""
+        return np.full((self.height, self.width, 3), 40, dtype=np.uint8)
+
+    def _generate_night_vision_background(self) -> np.ndarray:
+        """Generate night vision green background."""
+        img = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        img[:, :, 1] = 30  # Green channel
+        return img
+
+    def _add_clouds_cv(self, img: np.ndarray, tint: tuple = (255, 255, 255)) -> np.ndarray:
+        """Add clouds using OpenCV with optional color tint."""
+        for _ in range(random.randint(2, 5)):
+            cx = random.randint(0, self.width)
+            cy = random.randint(0, self.height // 2)
+            axes = (random.randint(40, 100), random.randint(20, 40))
+
+            overlay = img.copy()
+            cv2.ellipse(overlay, (cx, cy), axes, 0, 0, 360, tint, -1)
+            overlay = cv2.GaussianBlur(overlay, (21, 21), 10)
+            img = cv2.addWeighted(img, 0.7, overlay, 0.3, 0)
+        return img
+
+    def _add_clouds_pil(self, img: np.ndarray, tint: tuple = (255, 255, 255)) -> np.ndarray:
+        """Add clouds using Pillow with optional color tint."""
+        pil_img = Image.fromarray(img)
+        for _ in range(random.randint(2, 5)):
+            cx = random.randint(0, self.width)
+            cy = random.randint(0, self.height // 2)
+            w = random.randint(40, 100)
+            h = random.randint(20, 40)
+
+            cloud_layer = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
+            cloud_draw = ImageDraw.Draw(cloud_layer)
+            cloud_color = (*tint[:3], 180) if len(tint) == 3 else tint
+            cloud_draw.ellipse([cx - w, cy - h, cx + w, cy + h], fill=cloud_color)
+            cloud_layer = cloud_layer.filter(ImageFilter.GaussianBlur(radius=10))
+
+            pil_img = Image.alpha_composite(pil_img.convert("RGBA"), cloud_layer).convert("RGB")
+        return np.array(pil_img)
+
+    # ===== Scene Type Generation =====
+
+    def _generate_scene_background(self) -> np.ndarray:
+        """Generate background based on scene type from difficulty config."""
+        scene = self.difficulty_config.scene_type
+
+        if scene == "random":
+            scene = random.choice(["sky", "forest", "urban"])
+
+        if scene == "sky":
+            return self._generate_sky_for_lighting()
+        elif scene == "forest":
+            return self._generate_forest_background()
+        elif scene == "urban":
+            return self._generate_urban_background()
+
+        # Fallback to sky
+        return self._generate_sky_for_lighting()
+
+    def _generate_forest_background(self) -> np.ndarray:
+        """Generate forest/treeline background."""
+        img = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+
+        # Sky peek at top (use lighting mode colors)
+        mode = self.difficulty_config.lighting_mode
+        if mode == "random":
+            mode = random.choice(["day", "golden_hour", "overcast", "dusk"])
+
+        if mode == "day":
+            sky_colors = [(100, 150, 180), (150, 200, 210)]
+        elif mode == "golden_hour":
+            sky_colors = [(200, 140, 100), (230, 170, 120)]
+        elif mode == "overcast":
+            sky_colors = [(160, 160, 160), (180, 180, 180)]
+        elif mode == "dusk":
+            sky_colors = [(30, 40, 60), (50, 60, 100)]
+        elif mode == "night":
+            sky_colors = [(15, 15, 20), (20, 20, 30)]
+        else:
+            sky_colors = [(100, 150, 180), (150, 200, 210)]
+
+        # Draw sky gradient in top third
+        for y in range(self.height // 3):
+            ratio = y / (self.height // 3)
+            r = int(sky_colors[0][0] + ratio * (sky_colors[1][0] - sky_colors[0][0]))
+            g = int(sky_colors[0][1] + ratio * (sky_colors[1][1] - sky_colors[0][1]))
+            b = int(sky_colors[0][2] + ratio * (sky_colors[1][2] - sky_colors[0][2]))
+            img[y, :] = [r, g, b]
+
+        # Far treeline (darker, smaller)
+        self._draw_treeline(img, y_start=self.height // 3, height=self.height // 4,
+                           base_color=(20, 60, 20), variation=10)
+
+        # Near treeline (lighter, taller)
+        self._draw_treeline(img, y_start=self.height // 2, height=self.height // 2,
+                           base_color=(30, 80, 30), variation=15)
+
+        return img
+
+    def _draw_treeline(self, img: np.ndarray, y_start: int, height: int,
+                      base_color: tuple, variation: int = 10) -> None:
+        """Draw a treeline at specified position."""
+        # Create wavy treeline profile
+        num_trees = random.randint(8, 15)
+
+        for i in range(num_trees):
+            x = int(i * self.width / num_trees + random.randint(-10, 10))
+            tree_height = height + random.randint(-height // 4, height // 4)
+            tree_width = random.randint(self.width // 15, self.width // 8)
+
+            # Randomize color slightly
+            r = max(0, min(255, base_color[0] + random.randint(-variation, variation)))
+            g = max(0, min(255, base_color[1] + random.randint(-variation, variation)))
+            b = max(0, min(255, base_color[2] + random.randint(-variation, variation)))
+            color = (r, g, b)
+
+            # Draw triangular tree shape
+            if self.use_opencv:
+                pts = np.array([
+                    [x, y_start],
+                    [x - tree_width // 2, y_start + tree_height],
+                    [x + tree_width // 2, y_start + tree_height]
+                ], np.int32)
+                cv2.fillPoly(img, [pts], color)
+            else:
+                # Fill area below treeline
+                for ty in range(y_start, min(y_start + tree_height, self.height)):
+                    progress = (ty - y_start) / tree_height if tree_height > 0 else 0
+                    half_width = int((tree_width // 2) * progress)
+                    x_start = max(0, x - half_width)
+                    x_end = min(self.width, x + half_width)
+                    img[ty, x_start:x_end] = color
+
+    def _generate_urban_background(self) -> np.ndarray:
+        """Generate urban/cityscape background with buildings."""
+        # Start with sky
+        img = self._generate_sky_for_lighting()
+
+        # Add building silhouettes at bottom
+        for _ in range(random.randint(5, 10)):
+            x = random.randint(0, self.width - 30)
+            w = random.randint(20, 60)
+            h = random.randint(self.height // 4, self.height // 2)
+            y = self.height - h
+
+            # Building color (dark gray)
+            building_color = (40 + random.randint(0, 20),
+                            40 + random.randint(0, 20),
+                            50 + random.randint(0, 20))
+
+            if self.use_opencv:
+                cv2.rectangle(img, (x, y), (x + w, self.height), building_color, -1)
+
+                # Add windows
+                for wy in range(y + 5, self.height - 5, 10):
+                    for wx in range(x + 3, x + w - 3, 8):
+                        if random.random() < 0.3:
+                            window_color = (200, 200, 100)  # Yellow-ish lit window
+                            cv2.rectangle(img, (wx, wy), (wx + 4, wy + 6), window_color, -1)
+            else:
+                # Manual rectangle fill for Pillow backend
+                img[y:self.height, x:x+w] = building_color
+
+                # Add windows
+                for wy in range(y + 5, self.height - 5, 10):
+                    for wx in range(x + 3, min(x + w - 3, self.width - 4), 8):
+                        if random.random() < 0.3:
+                            img[wy:wy+6, wx:wx+4] = (200, 200, 100)
+
+        return img
 
     def _generate_placeholder_drone(self, size_px: int, is_kamikaze: bool) -> np.ndarray:
         """Generate a placeholder drone shape (RGBA numpy array)."""
@@ -343,9 +619,10 @@ class SpriteRenderer(BaseRenderer):
         if self.backgrounds:
             self._current_bg = self.backgrounds[random.randint(0, len(self.backgrounds) - 1)].copy()
         else:
-            self._current_bg = self._generate_sky_background()
+            # Use scene type and lighting mode from difficulty config
+            self._current_bg = self._generate_scene_background()
 
-        # Apply random augmentations
+        # Apply random brightness/contrast augmentations
         if self.augment_brightness:
             factor = random.uniform(0.8, 1.2)
             self._current_bg = np.clip(self._current_bg * factor, 0, 255).astype(np.uint8)
@@ -382,6 +659,157 @@ class SpriteRenderer(BaseRenderer):
         # Composite onto frame
         self._composite_sprite(frame, sprite, paste_x, paste_y)
 
+    def _render_distractor(self, distractor: Distractor, frame: np.ndarray) -> None:
+        """Render a flying distractor onto the frame."""
+        from drone_hunter.envs.game_state import DistractorType
+
+        screen_x, screen_y = self.normalized_to_screen(distractor.x, distractor.y)
+        size_px = int(distractor.size * self.width)
+        size_px = max(4, size_px)
+
+        if distractor.distractor_type == DistractorType.BIRD:
+            self._draw_bird(frame, screen_x, screen_y, size_px, distractor.age)
+        elif distractor.distractor_type == DistractorType.DEBRIS:
+            self._draw_debris(frame, screen_x, screen_y, size_px)
+        elif distractor.distractor_type == DistractorType.BALLOON:
+            self._draw_balloon(frame, screen_x, screen_y, size_px)
+        elif distractor.distractor_type == DistractorType.PLANE:
+            self._draw_plane(frame, screen_x, screen_y, size_px)
+
+    def _draw_bird(self, frame: np.ndarray, x: int, y: int, size: int, age: int) -> None:
+        """Draw a bird silhouette with flapping wings."""
+        # Wing flap animation
+        flap = (age // 4) % 2
+        wing_angle = 30 if flap else -20
+
+        color = (30, 30, 30)  # Dark silhouette
+
+        if self.use_opencv:
+            # Body
+            cv2.ellipse(frame, (x, y), (size // 3, size // 6), 0, 0, 360, color, -1)
+            # Wings
+            wing_len = size // 2
+            if flap:
+                # Wings up
+                cv2.line(frame, (x, y), (x - wing_len, y - wing_len // 2), color, 2)
+                cv2.line(frame, (x, y), (x + wing_len, y - wing_len // 2), color, 2)
+            else:
+                # Wings down
+                cv2.line(frame, (x, y), (x - wing_len, y + wing_len // 3), color, 2)
+                cv2.line(frame, (x, y), (x + wing_len, y + wing_len // 3), color, 2)
+        else:
+            # Simple ellipse for body
+            half = size // 6
+            frame[max(0, y-half):min(frame.shape[0], y+half),
+                  max(0, x-size//3):min(frame.shape[1], x+size//3)] = color
+
+    def _draw_debris(self, frame: np.ndarray, x: int, y: int, size: int) -> None:
+        """Draw small debris speck."""
+        color = (50, 50, 50)
+        radius = max(2, size // 4)
+
+        if self.use_opencv:
+            cv2.circle(frame, (x, y), radius, color, -1)
+        else:
+            # Simple square
+            frame[max(0, y-radius):min(frame.shape[0], y+radius),
+                  max(0, x-radius):min(frame.shape[1], x+radius)] = color
+
+    def _draw_balloon(self, frame: np.ndarray, x: int, y: int, size: int) -> None:
+        """Draw a balloon shape."""
+        balloon_color = (random.randint(150, 255), random.randint(50, 150), random.randint(50, 150))
+        string_color = (80, 80, 80)
+
+        if self.use_opencv:
+            # Balloon body
+            cv2.ellipse(frame, (x, y), (size // 2, size // 2 + size // 4), 0, 0, 360, balloon_color, -1)
+            # String
+            cv2.line(frame, (x, y + size // 2), (x, y + size), string_color, 1)
+        else:
+            half = size // 2
+            frame[max(0, y-half):min(frame.shape[0], y+half),
+                  max(0, x-half):min(frame.shape[1], x+half)] = balloon_color
+
+    def _draw_plane(self, frame: np.ndarray, x: int, y: int, size: int) -> None:
+        """Draw a fixed-wing aircraft silhouette."""
+        color = (60, 60, 60)
+
+        if self.use_opencv:
+            # Fuselage
+            cv2.ellipse(frame, (x, y), (size // 2, size // 8), 0, 0, 360, color, -1)
+            # Wings
+            pts = np.array([
+                [x - size // 6, y],
+                [x - size // 3, y - size // 3],
+                [x + size // 3, y - size // 3],
+                [x + size // 6, y]
+            ], np.int32)
+            cv2.fillPoly(frame, [pts], color)
+            # Tail
+            cv2.line(frame, (x - size // 2, y), (x - size // 2, y - size // 4), color, 2)
+        else:
+            half = size // 4
+            frame[max(0, y-half):min(frame.shape[0], y+half),
+                  max(0, x-size//2):min(frame.shape[1], x+size//2)] = color
+
+    def _render_static_obstacle(self, obstacle: StaticObstacle, frame: np.ndarray) -> None:
+        """Render a static obstacle onto the frame."""
+        from drone_hunter.envs.game_state import StaticObstacleType
+
+        if obstacle.obstacle_type == StaticObstacleType.TREE:
+            self._draw_tree_obstacle(frame, obstacle)
+        elif obstacle.obstacle_type == StaticObstacleType.POWERLINE:
+            self._draw_powerline_obstacle(frame, obstacle)
+
+    def _draw_tree_obstacle(self, frame: np.ndarray, obstacle: StaticObstacle) -> None:
+        """Draw a tree silhouette obstacle."""
+        cx = int((obstacle.x + obstacle.sway_offset) * self.width)
+        bottom = int(obstacle.y * self.height)
+        w = int(obstacle.width * self.width)
+        h = int(obstacle.height * self.height)
+
+        trunk_color = (30, 20, 10)
+        canopy_color = (20, 50, 20)
+
+        if self.use_opencv:
+            # Trunk
+            trunk_w = w // 5
+            cv2.rectangle(frame,
+                         (cx - trunk_w // 2, bottom - h // 3),
+                         (cx + trunk_w // 2, bottom),
+                         trunk_color, -1)
+            # Canopy (triangle)
+            pts = np.array([
+                [cx, bottom - h],
+                [cx - w // 2, bottom - h // 3],
+                [cx + w // 2, bottom - h // 3]
+            ], np.int32)
+            cv2.fillPoly(frame, [pts], canopy_color)
+        else:
+            # Simple rectangle for trunk and triangle for canopy
+            trunk_w = w // 5
+            frame[bottom - h // 3:bottom,
+                  max(0, cx - trunk_w // 2):min(frame.shape[1], cx + trunk_w // 2)] = trunk_color
+
+    def _draw_powerline_obstacle(self, frame: np.ndarray, obstacle: StaticObstacle) -> None:
+        """Draw horizontal powerline with poles."""
+        y_px = int(obstacle.y * self.height)
+        wire_color = (30, 30, 30)
+        pole_color = (50, 40, 30)
+
+        if self.use_opencv:
+            # Main wire
+            cv2.line(frame, (0, y_px), (self.width, y_px), wire_color, 2)
+            # Second wire (slight offset)
+            cv2.line(frame, (0, y_px + 4), (self.width, y_px + 4), wire_color, 1)
+            # Poles at edges
+            cv2.line(frame, (15, y_px - 25), (15, y_px + 10), pole_color, 4)
+            cv2.line(frame, (self.width - 15, y_px - 25), (self.width - 15, y_px + 10), pole_color, 4)
+        else:
+            # Simple horizontal lines
+            frame[y_px:y_px + 2, :] = wire_color
+            frame[y_px + 4:y_px + 5, :] = wire_color
+
     def render(self, game_state: GameState) -> np.ndarray:
         """Render the current game state to an RGB frame."""
         if self._current_bg is None:
@@ -389,9 +817,22 @@ class SpriteRenderer(BaseRenderer):
 
         frame = self._current_bg.copy()
 
-        for drone in game_state.drones:
+        # 1. Render static obstacles first (background layer)
+        for obstacle in game_state.static_obstacles:
+            self._render_static_obstacle(obstacle, frame)
+
+        # 2. Render flying distractors (sorted by depth, far to near)
+        for distractor in sorted(game_state.distractors, key=lambda d: -d.z):
+            if distractor.is_on_screen():
+                self._render_distractor(distractor, frame)
+
+        # 3. Render drones (sorted by depth, far to near)
+        for drone in sorted(game_state.drones, key=lambda d: -d.z):
             if drone.is_on_screen():
                 self._render_drone(drone, frame)
+
+        # Apply post-processing augmentations based on difficulty
+        frame = self._apply_augmentations(frame)
 
         return frame
 
@@ -407,9 +848,22 @@ class SpriteRenderer(BaseRenderer):
 
         frame = self._current_bg.copy()
 
-        for drone in game_state.drones:
+        # 1. Render static obstacles first (background layer)
+        for obstacle in game_state.static_obstacles:
+            self._render_static_obstacle(obstacle, frame)
+
+        # 2. Render flying distractors (sorted by depth, far to near)
+        for distractor in sorted(game_state.distractors, key=lambda d: -d.z):
+            if distractor.is_on_screen():
+                self._render_distractor(distractor, frame)
+
+        # 3. Render drones (sorted by depth, far to near)
+        for drone in sorted(game_state.drones, key=lambda d: -d.z):
             if drone.is_on_screen():
                 self._render_drone(drone, frame)
+
+        # Apply post-processing augmentations BEFORE overlays (so HUD is readable)
+        frame = self._apply_augmentations(frame)
 
         # Draw overlays
         if self.use_opencv:
@@ -537,3 +991,111 @@ class SpriteRenderer(BaseRenderer):
             draw.text((self.width // 2 - 30, 10), "THREAT!", fill=(255, 0, 0))
 
         return np.array(pil_img)
+
+    def _apply_augmentations(self, frame: np.ndarray) -> np.ndarray:
+        """Apply post-processing augmentations based on difficulty config.
+
+        Args:
+            frame: RGB frame as numpy array.
+
+        Returns:
+            Augmented frame.
+        """
+        config = self.difficulty_config
+
+        # Apply weather effects first (they affect the whole scene)
+        if config.rain_intensity > 0:
+            from drone_hunter.envs.renderer.effects import apply_rain
+            frame = apply_rain(frame, config.rain_intensity)
+
+        if config.fog_density > 0:
+            from drone_hunter.envs.renderer.effects import apply_fog_gradient
+            frame = apply_fog_gradient(frame, config.fog_density)
+
+        # Apply noise
+        if config.noise_level > 0:
+            frame = self._apply_noise(frame, config.noise_level)
+
+        # Apply hue shift
+        if config.hue_shift_range > 0:
+            frame = self._apply_hue_shift(frame, config.hue_shift_range)
+
+        # Apply JPEG compression artifacts
+        if config.jpeg_quality < 100:
+            frame = self._apply_jpeg_compression(frame, config.jpeg_quality)
+
+        return frame
+
+    def _apply_noise(self, frame: np.ndarray, noise_level: float) -> np.ndarray:
+        """Apply Gaussian noise to simulate sensor noise.
+
+        Args:
+            frame: RGB frame.
+            noise_level: Standard deviation of noise (0.0-0.3).
+
+        Returns:
+            Noisy frame.
+        """
+        noise = np.random.normal(0, noise_level * 255, frame.shape).astype(np.float32)
+        noisy = frame.astype(np.float32) + noise
+        return np.clip(noisy, 0, 255).astype(np.uint8)
+
+    def _apply_hue_shift(self, frame: np.ndarray, shift_range: float) -> np.ndarray:
+        """Apply random hue shift to simulate color variation.
+
+        Args:
+            frame: RGB frame.
+            shift_range: Maximum hue shift (0.0-0.15).
+
+        Returns:
+            Hue-shifted frame.
+        """
+        shift = random.uniform(-shift_range, shift_range)
+
+        if self.use_opencv:
+            # Convert RGB to HSV
+            hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV).astype(np.float32)
+            # Hue is 0-180 in OpenCV
+            hsv[:, :, 0] = (hsv[:, :, 0] + shift * 180) % 180
+            hsv = hsv.astype(np.uint8)
+            return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+        else:
+            # Use Pillow
+            pil_img = Image.fromarray(frame)
+            hsv = pil_img.convert("HSV")
+            h, s, v = hsv.split()
+            # Pillow hue is 0-255
+            h_arr = np.array(h, dtype=np.float32)
+            h_arr = (h_arr + shift * 255) % 255
+            h = Image.fromarray(h_arr.astype(np.uint8))
+            hsv = Image.merge("HSV", (h, s, v))
+            return np.array(hsv.convert("RGB"))
+
+    def _apply_jpeg_compression(self, frame: np.ndarray, quality: int) -> np.ndarray:
+        """Apply JPEG compression artifacts.
+
+        Args:
+            frame: RGB frame.
+            quality: JPEG quality (50-100).
+
+        Returns:
+            Compressed frame with artifacts.
+        """
+        if self.use_opencv:
+            # Encode then decode to simulate compression
+            _, encoded = cv2.imencode(
+                ".jpg",
+                cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                [cv2.IMWRITE_JPEG_QUALITY, quality]
+            )
+            decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+            return cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
+        else:
+            # Use Pillow
+            from io import BytesIO
+            pil_img = Image.fromarray(frame)
+            buffer = BytesIO()
+            pil_img.save(buffer, format="JPEG", quality=quality)
+            buffer.seek(0)
+            compressed = Image.open(buffer)
+            return np.array(compressed.convert("RGB"))

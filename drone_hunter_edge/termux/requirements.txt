@@ -1,0 +1,17 @@
+# Drone Hunter Edge - Termux Requirements
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+numpy>=1.21.0
+Pillow>=9.0.0
+
+# Inference backends (install one or both)
+# ONNX Runtime - CPU inference
+onnxruntime>=1.15.0
+
+# NCNN - Mobile-optimized inference (optional)
+# Install via: pip install ncnn
+# ncnn>=1.0.0
+
+# Note: Do NOT install scipy, opencv-python, or torch
+# These are too large for Termux and not needed for inference

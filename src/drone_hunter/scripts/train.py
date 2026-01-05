@@ -27,6 +27,8 @@ def make_env(
     single_target_mode: bool = False,
     detection_noise: float = 0.02,
     detection_dropout: float = 0.05,
+    detector_model: str | None = None,
+    difficulty: str | None = None,
 ) -> gym.Env:
     """Create a Drone Hunter environment.
 
@@ -38,6 +40,8 @@ def make_env(
         single_target_mode: If True, only pass most urgent drone.
         detection_noise: Noise std for simulated detector (detector mode only).
         detection_dropout: Probability of missing detection (detector mode only).
+        detector_model: Path to ONNX detector model (uses real detector instead of simulated).
+        difficulty: Visual difficulty preset (easy, medium, hard, forest, urban).
 
     Returns:
         Gymnasium environment.
@@ -51,6 +55,8 @@ def make_env(
         single_target_mode=single_target_mode,
         detection_noise=detection_noise,
         detection_dropout=detection_dropout,
+        detector_model=detector_model,
+        difficulty=difficulty,
     )
 
 
@@ -78,6 +84,9 @@ def train(
     oracle_mode: bool = True,
     detection_noise: float = 0.02,
     detection_dropout: float = 0.05,
+    detector_model: str | None = None,
+    resume_path: str | None = None,
+    difficulty: str | None = None,
 ) -> PPO:
     """Train a PPO agent on Drone Hunter.
 
@@ -104,6 +113,9 @@ def train(
         oracle_mode: If True, use ground truth. If False, use Kalman tracker.
         detection_noise: Noise std for simulated detector (detector mode only).
         detection_dropout: Probability of missing detection (detector mode only).
+        detector_model: Path to ONNX detector model (uses real detector instead of simulated).
+        resume_path: Path to model.zip to resume training from (for fine-tuning).
+        difficulty: Visual difficulty preset (easy, medium, hard, forest, urban).
 
     Returns:
         Trained PPO model.
@@ -126,9 +138,14 @@ def train(
     print(f"Single-target mode: {single_target_mode}")
     print(f"Oracle mode: {oracle_mode}")
     if not oracle_mode:
-        print(f"Detection noise: {detection_noise}")
-        print(f"Detection dropout: {detection_dropout}")
+        if detector_model:
+            print(f"Detector model: {detector_model}")
+        else:
+            print(f"Detection noise: {detection_noise}")
+            print(f"Detection dropout: {detection_dropout}")
     print(f"Observation normalization: {norm_obs}")
+    if difficulty:
+        print(f"Visual difficulty: {difficulty}")
     print("-" * 50)
 
     # Create vectorized environment
@@ -140,6 +157,8 @@ def train(
             single_target_mode=single_target_mode,
             detection_noise=detection_noise,
             detection_dropout=detection_dropout,
+            detector_model=detector_model,
+            difficulty=difficulty,
         )
 
     vec_env = make_vec_env(env_fn, n_envs=n_envs)
@@ -192,22 +211,31 @@ def train(
 
     print(f"Policy network: {net_arch} with ReLU activation")
 
-    # Create PPO model
-    model = PPO(
-        "MultiInputPolicy",
-        vec_env,
-        learning_rate=learning_rate,
-        n_steps=n_steps,
-        batch_size=batch_size,
-        n_epochs=n_epochs,
-        gamma=gamma,
-        gae_lambda=gae_lambda,
-        clip_range=clip_range,
-        ent_coef=ent_coef,
-        verbose=verbose,
-        tensorboard_log=str(run_dir / "tensorboard"),
-        policy_kwargs=policy_kwargs,
-    )
+    # Create or load PPO model
+    if resume_path:
+        print(f"Resuming from: {resume_path}")
+        model = PPO.load(
+            resume_path,
+            env=vec_env,
+            learning_rate=learning_rate,
+            tensorboard_log=str(run_dir / "tensorboard"),
+        )
+    else:
+        model = PPO(
+            "MultiInputPolicy",
+            vec_env,
+            learning_rate=learning_rate,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            n_epochs=n_epochs,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            clip_range=clip_range,
+            ent_coef=ent_coef,
+            verbose=verbose,
+            tensorboard_log=str(run_dir / "tensorboard"),
+            policy_kwargs=policy_kwargs,
+        )
 
     print(f"Model policy: {model.policy}")
     print("-" * 50)
@@ -277,6 +305,15 @@ def main() -> None:
                        help="Noise std for simulated detector (detector mode only)")
     parser.add_argument("--detection-dropout", type=float, default=0.05,
                        help="Probability of missing detection (detector mode only)")
+    parser.add_argument("--detector-model", type=str, default=None,
+                       help="Path to ONNX detector model (uses real detector instead of simulated)")
+    parser.add_argument("--resume", type=str, default=None,
+                       help="Path to model.zip to resume training from (for fine-tuning)")
+
+    # Visual difficulty
+    parser.add_argument("--difficulty", type=str, default=None,
+                       choices=["easy", "medium", "hard", "forest", "urban"],
+                       help="Visual difficulty preset (only affects detector, not gameplay)")
 
     args = parser.parse_args()
 
@@ -304,6 +341,9 @@ def main() -> None:
         oracle_mode=not args.detector_mode,
         detection_noise=args.detection_noise,
         detection_dropout=args.detection_dropout,
+        detector_model=args.detector_model,
+        resume_path=args.resume,
+        difficulty=args.difficulty,
     )
 
 
