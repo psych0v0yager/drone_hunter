@@ -183,13 +183,16 @@ class DroneTrack:
 class KalmanTracker:
     """Multi-object tracker using Kalman filters for depth estimation."""
 
-    REFERENCE_HEIGHT: float = 0.06
+    # Adjusted for edge: smaller reference to get better z resolution for small drones
+    # Original: 0.06 @ z=0.5 means bbox=0.03 gives z=1.0 (clamped)
+    # New: 0.03 @ z=0.5 means bbox=0.03 gives z=0.5, bbox=0.06 gives z=0.25
+    REFERENCE_HEIGHT: float = 0.03
     REFERENCE_Z: float = 0.5
 
     def __init__(
         self,
         max_age: int = 5,
-        min_hits: int = 2,
+        min_hits: int = 1,  # Reduced from 2 - detections are intermittent
         iou_threshold: float = 0.2,
     ):
         self.max_age = max_age

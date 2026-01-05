@@ -73,7 +73,7 @@ def run_simulation(
             detector = create_detector(
                 detector_model,
                 backend_type=backend_type,
-                conf_threshold=0.55,
+                conf_threshold=0.60,
                 iou_threshold=0.5,
             )
             if verbose:
@@ -90,7 +90,7 @@ def run_simulation(
             from inference.policy import SimplePolicyInference
             policy = SimplePolicyInference(
                 policy_model,
-                action_dims=(9, grid_size, grid_size),
+                grid_size=grid_size,
                 deterministic=True,
             )
             if verbose:
@@ -182,36 +182,42 @@ def run_simulation(
                 obs = normalizer.normalize(obs)
 
             # Get action
+            # Discrete(65): 0 = wait, 1-64 = fire at grid position
             if policy:
-                action = policy.predict(obs)
+                action_idx, grid_coords = policy.predict(obs)
             else:
-                # Random action
-                action = np.array([
-                    np.random.randint(0, 9),
-                    np.random.randint(0, grid_size),
-                    np.random.randint(0, grid_size),
-                ], dtype=np.int32)
+                # Random action: 20% wait, 80% fire at random cell
+                if np.random.random() < 0.2:
+                    action_idx = 0
+                    grid_coords = None
+                else:
+                    action_idx = np.random.randint(1, grid_size * grid_size + 1)
+                    cell_idx = action_idx - 1
+                    grid_coords = (cell_idx % grid_size, cell_idx // grid_size)
 
             # Execute action
-            fire_action = action[0]
-            grid_x = action[1]
-            grid_y = action[2]
+            reward = 0.01  # Survival reward per frame
+            grid_x, grid_y = None, None
 
-            reward = 0.0
-
-            if fire_action == 1:  # Fire
+            if action_idx > 0 and grid_coords is not None:
+                # Fire action
+                grid_x, grid_y = grid_coords
                 hit, drone = game_state.fire(grid_x, grid_y, grid_size)
                 if hit:
                     reward += 2.0 if drone and drone.is_kamikaze else 1.0
                 else:
-                    reward -= 0.3
-            elif fire_action == 2:  # Manual reload
-                if not game_state.is_reloading and game_state.ammo < game_state.clip_size:
-                    game_state.is_reloading = True
-                    game_state.reload_timer = 0
+                    reward -= 0.1  # Match original (was 0.3)
 
             # Step game
             game_state.step()
+
+            # Game over rewards/penalties
+            if game_state.game_over:
+                if game_state.game_over_reason == "Kamikaze impact!":
+                    reward -= 5.0
+                elif game_state.game_over_reason == "Episode complete!":
+                    reward += 3.0
+
             episode_reward += reward
             step += 1
 
@@ -220,7 +226,7 @@ def run_simulation(
                 overlay_frame = renderer.render_with_overlay(
                     game_state,
                     grid_size=grid_size,
-                    highlight_cell=(grid_x, grid_y) if fire_action == 1 else None,
+                    highlight_cell=(grid_x, grid_y) if action_idx > 0 else None,
                     detections=detections,
                 )
                 img = Image.fromarray(overlay_frame)
