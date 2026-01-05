@@ -261,13 +261,14 @@ def run_live(
             episode_reward += reward
             step += 1
 
-            # Render with overlay
+            # Render with overlay (reuse pre-rendered frame)
             t0 = time.perf_counter()
             overlay_frame = renderer.render_with_overlay(
                 game_state,
                 grid_size=grid_size,
                 highlight_cell=(grid_x, grid_y) if action_idx > 0 else None,
                 detections=detections,
+                frame=frame,  # Reuse frame from detection step
             )
 
             # Convert to pygame surface

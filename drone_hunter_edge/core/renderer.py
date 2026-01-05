@@ -194,6 +194,7 @@ class Renderer:
         grid_size: int = 8,
         highlight_cell: Optional[Tuple[int, int]] = None,
         detections: Optional[List] = None,
+        frame: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Render game state with debug overlay.
 
@@ -202,11 +203,13 @@ class Renderer:
             grid_size: Size of the firing grid
             highlight_cell: Grid cell to highlight (gx, gy)
             detections: Optional list of Detection objects to draw
+            frame: Pre-rendered frame to use (avoids double rendering)
 
         Returns:
             RGB numpy array with overlays
         """
-        frame = self.render(game_state)
+        if frame is None:
+            frame = self.render(game_state)
         pil_img = Image.fromarray(frame)
         draw = ImageDraw.Draw(pil_img)
 
