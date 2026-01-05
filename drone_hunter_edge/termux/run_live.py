@@ -259,7 +259,7 @@ def run_live(
                 )
 
             # Convert to pygame
-            pygame_image = pygame.image.fromstring(
+            pygame_image = pygame.image.frombytes(
                 pil_image.tobytes(), pil_image.size, pil_image.mode
             )
             screen.blit(pygame_image, (0, 0))
