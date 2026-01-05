@@ -43,24 +43,25 @@ def export_vec_normalize_stats(
 
     stats = {}
 
-    # Extract observation normalization stats
-    if hasattr(vec_normalize, "obs_rms"):
-        obs_rms = vec_normalize.obs_rms
+    # Access internal attributes directly to avoid SB3 wrapper recursion
+    obs_rms = getattr(vec_normalize, "obs_rms", None)
+    clip_obs = getattr(vec_normalize, "clip_obs", 10.0)
 
-        # Handle dict observations
+    if obs_rms is not None:
+        # Handle dict observations (common for Dict observation spaces)
         if isinstance(obs_rms, dict):
             for key, rms in obs_rms.items():
                 stats[key] = {
                     "mean": rms.mean.tolist(),
                     "var": rms.var.tolist(),
-                    "clip": vec_normalize.clip_obs,
+                    "clip": clip_obs,
                 }
         else:
-            # Single observation space
+            # Single observation space - RunningMeanStd object
             stats["obs"] = {
                 "mean": obs_rms.mean.tolist(),
                 "var": obs_rms.var.tolist(),
-                "clip": vec_normalize.clip_obs,
+                "clip": clip_obs,
             }
 
     with open(output_path, "w") as f:
@@ -109,20 +110,21 @@ def export_policy_to_onnx(
         obs_dim: Flattened observation dimension.
         opset_version: ONNX opset version.
     """
-    # Load model
+    # Load model on CPU to avoid device issues during export
     model = load_sb3_model(model_path)
 
-    # Get policy network
-    policy = model.policy
+    # Get policy network and move to CPU
+    policy = model.policy.to("cpu")
 
     # Create wrapper
     wrapper = PolicyWrapper(policy)
     wrapper.eval()
+    wrapper.to("cpu")
 
     # Create dummy input
     dummy_input = torch.randn(1, obs_dim)
 
-    # Export to ONNX
+    # Export to ONNX using legacy tracing (more compatible)
     torch.onnx.export(
         wrapper,
         dummy_input,
@@ -135,6 +137,7 @@ def export_policy_to_onnx(
         },
         opset_version=opset_version,
         do_constant_folding=True,
+        dynamo=False,  # Use legacy tracing instead of dynamo
     )
 
     print(f"Exported policy to: {output_path}")

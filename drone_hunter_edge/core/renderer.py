@@ -31,13 +31,15 @@ class Renderer:
         self.width = width
         self.height = height
         self._current_bg: Optional[np.ndarray] = None
+        # Use separate RNG to avoid affecting game state randomness
+        self._rng = random.Random(0)
 
     def reset_background(self) -> None:
         """Generate a new random background for the episode."""
         self._current_bg = self._generate_sky_background()
 
         # Apply random brightness variation
-        factor = random.uniform(0.85, 1.15)
+        factor = self._rng.uniform(0.85, 1.15)
         self._current_bg = np.clip(self._current_bg * factor, 0, 255).astype(np.uint8)
 
     def _generate_sky_background(self) -> np.ndarray:
@@ -54,11 +56,11 @@ class Renderer:
             draw.line([(0, y), (self.width, y)], fill=(r, g, b))
 
         # Add clouds
-        for _ in range(random.randint(2, 5)):
-            cx = random.randint(0, self.width)
-            cy = random.randint(0, self.height // 2)
-            w = random.randint(40, 100)
-            h = random.randint(20, 40)
+        for _ in range(self._rng.randint(2, 5)):
+            cx = self._rng.randint(0, self.width)
+            cy = self._rng.randint(0, self.height // 2)
+            w = self._rng.randint(40, 100)
+            h = self._rng.randint(20, 40)
 
             cloud_layer = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
             cloud_draw = ImageDraw.Draw(cloud_layer)
@@ -154,7 +156,7 @@ class Renderer:
         sprite = self._generate_placeholder_drone(size_px, drone.is_kamikaze)
 
         # Random slight rotation for visual variety
-        angle = random.uniform(-15, 15)
+        angle = self._rng.uniform(-15, 15)
         if abs(angle) > 1:
             pil_img = Image.fromarray(sprite)
             pil_img = pil_img.rotate(angle, expand=False, resample=Image.Resampling.BILINEAR)

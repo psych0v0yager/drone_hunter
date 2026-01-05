@@ -112,20 +112,22 @@ class PolicyInference:
 class SimplePolicyInference:
     """Simplified policy inference using direct ONNX loading.
 
-    Alternative to backend-based approach for simpler deployment.
+    Handles Discrete(65) action space:
+    - Action 0 = wait/no-op
+    - Actions 1-64 = fire at grid cell (grid_x = (action-1) % grid_size, grid_y = (action-1) // grid_size)
     """
 
     def __init__(
         self,
         model_path: str,
-        action_dims: Tuple[int, int, int] = (9, 8, 8),
+        grid_size: int = 8,
         deterministic: bool = True,
     ):
         """Initialize with ONNX model path.
 
         Args:
             model_path: Path to ONNX policy model.
-            action_dims: Dimensions of MultiDiscrete action space.
+            grid_size: Size of firing grid (default 8x8 = 64 fire positions + 1 wait = 65).
             deterministic: Take argmax if True.
         """
         try:
@@ -133,7 +135,8 @@ class SimplePolicyInference:
         except ImportError:
             raise ImportError("onnxruntime required for SimplePolicyInference")
 
-        self.action_dims = action_dims
+        self.grid_size = grid_size
+        self.num_actions = grid_size * grid_size + 1  # 64 fire + 1 wait
         self.deterministic = deterministic
 
         # Load model
@@ -149,21 +152,24 @@ class SimplePolicyInference:
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
 
-    def predict(self, obs: Dict[str, np.ndarray]) -> np.ndarray:
+    def predict(self, obs: Dict[str, np.ndarray]) -> Tuple[int, Optional[Tuple[int, int]]]:
         """Get action from observation.
 
         Args:
-            obs: Dictionary observation.
+            obs: Dictionary observation with "target" and "game_state".
 
         Returns:
-            Action array [fire, grid_x, grid_y].
+            Tuple of (action_idx, grid_coords) where:
+            - action_idx: Raw action (0=wait, 1-64=fire)
+            - grid_coords: (grid_x, grid_y) if firing, None if waiting
         """
-        # Flatten and batch
+        # Flatten and batch (order must match SB3 CombinedExtractor: sorted keys)
+        # Keys sorted alphabetically: game_state, target
         parts = []
-        if "target" in obs:
-            parts.append(obs["target"].flatten())
         if "game_state" in obs:
             parts.append(obs["game_state"].flatten())
+        if "target" in obs:
+            parts.append(obs["target"].flatten())
 
         flat_obs = np.concatenate(parts).astype(np.float32)
         input_tensor = flat_obs[np.newaxis, :]
@@ -176,18 +182,19 @@ class SimplePolicyInference:
 
         logits = outputs[0][0]
 
-        # Decode action
-        actions = []
-        offset = 0
-        for dim in self.action_dims:
-            action_logits = logits[offset:offset + dim]
-            if self.deterministic:
-                action = np.argmax(action_logits)
-            else:
-                probs = np.exp(action_logits - np.max(action_logits))
-                probs = probs / np.sum(probs)
-                action = np.random.choice(dim, p=probs)
-            actions.append(action)
-            offset += dim
+        # Get action
+        if self.deterministic:
+            action = int(np.argmax(logits))
+        else:
+            probs = np.exp(logits - np.max(logits))
+            probs = probs / np.sum(probs)
+            action = int(np.random.choice(len(logits), p=probs))
 
-        return np.array(actions, dtype=np.int32)
+        # Decode to grid coordinates
+        if action == 0:
+            return action, None
+        else:
+            cell_idx = action - 1
+            grid_x = cell_idx % self.grid_size
+            grid_y = cell_idx // self.grid_size
+            return action, (grid_x, grid_y)
