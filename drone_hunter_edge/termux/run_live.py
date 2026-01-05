@@ -271,20 +271,12 @@ def run_live(
                 frame=frame,  # Reuse frame from detection step
             )
 
-            # Convert to pygame surface
-            # PIL Image -> pygame surface
-            pil_image = Image.fromarray(overlay_frame)
+            # Convert to pygame surface (direct numpy -> pygame, skip PIL)
+            # pygame.surfarray expects (width, height, channels), numpy is (height, width, channels)
+            pygame_surface = pygame.surfarray.make_surface(overlay_frame.swapaxes(0, 1))
             if display_scale != 1:
-                pil_image = pil_image.resize(
-                    (display_width, display_height),
-                    Image.Resampling.NEAREST
-                )
-
-            # Convert to pygame
-            pygame_image = pygame.image.frombytes(
-                pil_image.tobytes(), pil_image.size, pil_image.mode
-            )
-            screen.blit(pygame_image, (0, 0))
+                pygame_surface = pygame.transform.scale(pygame_surface, (display_width, display_height))
+            screen.blit(pygame_surface, (0, 0))
 
             # Draw additional HUD
             mode_text = "ORACLE" if oracle_mode else "DETECTOR"
