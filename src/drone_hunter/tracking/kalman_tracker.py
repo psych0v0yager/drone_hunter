@@ -148,8 +148,9 @@ class KalmanTracker:
     """
 
     # Depth estimation calibration
-    # Reference: at z=0.5, a drone has bbox_height ≈ 0.125 (40px at 320px height)
-    REFERENCE_HEIGHT: float = 0.125
+    # Reference: at z=0.5, a drone has bbox_height ≈ 0.06 (based on base_size=0.06)
+    # Formula: size = base_size * (0.5 / z), so at z=0.5, size = base_size
+    REFERENCE_HEIGHT: float = 0.06
     REFERENCE_Z: float = 0.5
 
     def __init__(

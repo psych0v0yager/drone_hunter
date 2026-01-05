@@ -29,6 +29,10 @@ def evaluate(
     grid_size: int = 8,
     deterministic: bool = True,
     single_target_mode: bool = False,
+    detector_mode: bool = False,
+    detector_model: Path | str | None = None,
+    show_gt_boxes: bool = True,
+    show_detector_boxes: bool = True,
 ) -> dict:
     """Evaluate a trained model.
 
@@ -41,6 +45,10 @@ def evaluate(
         grid_size: Firing grid size
         deterministic: Use deterministic actions
         single_target_mode: Use single-target observation mode
+        detector_mode: Use detector mode (Kalman tracker) instead of oracle
+        detector_model: Path to ONNX detector model for real detection
+        show_gt_boxes: Show ground truth bounding boxes (green/red)
+        show_detector_boxes: Show detector predictions (yellow)
 
     Returns:
         Dictionary with evaluation stats
@@ -58,8 +66,9 @@ def evaluate(
             render_mode="rgb_array" if render else None,
             grid_size=grid_size,
             max_frames=1000,
-            oracle_mode=True,
+            oracle_mode=not detector_mode,
             single_target_mode=single_target_mode,
+            detector_model=detector_model,
         )
 
     env = DummyVecEnv([make_env])
@@ -100,15 +109,43 @@ def evaluate(
             steps += 1
 
             if render and HAS_OPENCV:
-                # Get frame from underlying env
-                frame = env.envs[0].render()
-                if frame is not None:
-                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    cv2.imshow("Drone Hunter - Trained Agent", frame_bgr)
-                    key = cv2.waitKey(frame_delay)
-                    if key == ord('q'):
-                        done = True
-                        break
+                underlying_env = env.envs[0].unwrapped
+                renderer = underlying_env.renderer
+                game_state = underlying_env.game_state
+                h, w = renderer.height, renderer.width
+
+                # Get clean frame (what detector sees)
+                clean_frame = renderer.render(game_state)
+
+                # Start with clean or overlay frame
+                if show_gt_boxes:
+                    # Use overlay rendering (includes GT boxes, grid, HUD)
+                    frame = renderer.render_with_overlay(game_state, grid_size=grid_size)
+                else:
+                    frame = clean_frame.copy()
+
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+                # Draw detector bounding boxes (yellow) if enabled
+                if show_detector_boxes and hasattr(underlying_env, 'detector') and underlying_env.detector is not None:
+                    detections = underlying_env.detector.detect(clean_frame)
+                    for det in detections:
+                        # Convert normalized coords to pixels
+                        x1 = int((det.x - det.w/2) * w)
+                        y1 = int((det.y - det.h/2) * h)
+                        x2 = int((det.x + det.w/2) * w)
+                        y2 = int((det.y + det.h/2) * h)
+                        # Yellow box for detector predictions
+                        cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                        # Confidence label
+                        cv2.putText(frame_bgr, f"{det.confidence:.2f}",
+                                   (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+                cv2.imshow("Drone Hunter - Trained Agent", frame_bgr)
+                key = cv2.waitKey(frame_delay)
+                if key == ord('q'):
+                    done = True
+                    break
 
         # Get final info
         final_info = info[0]
@@ -170,6 +207,14 @@ def main():
                        help="Use stochastic actions instead of deterministic")
     parser.add_argument("--single-target", action="store_true",
                        help="Use single-target observation mode")
+    parser.add_argument("--detector-mode", action="store_true",
+                       help="Use detector mode with Kalman tracker (no ground truth)")
+    parser.add_argument("--detector-model", type=str, default=None,
+                       help="Path to ONNX detector model (e.g., models/nanodet.onnx)")
+    parser.add_argument("--no-gt-boxes", action="store_true",
+                       help="Hide ground truth bounding boxes (green/red)")
+    parser.add_argument("--no-detector-boxes", action="store_true",
+                       help="Hide detector prediction boxes (yellow)")
 
     args = parser.parse_args()
 
@@ -182,6 +227,10 @@ def main():
         grid_size=args.grid_size,
         deterministic=not args.stochastic,
         single_target_mode=args.single_target,
+        detector_mode=args.detector_mode,
+        detector_model=args.detector_model,
+        show_gt_boxes=not args.no_gt_boxes,
+        show_detector_boxes=not args.no_detector_boxes,
     )
 
 

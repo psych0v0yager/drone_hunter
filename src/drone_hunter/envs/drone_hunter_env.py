@@ -11,6 +11,7 @@ from gymnasium import spaces
 
 from drone_hunter.envs.game_state import GameState
 from drone_hunter.envs.renderer import SpriteRenderer
+from drone_hunter.tracking import Detection, KalmanTracker
 
 
 class DroneHunterEnv(gym.Env):
@@ -51,7 +52,10 @@ class DroneHunterEnv(gym.Env):
         max_frames: int = 1000,
         oracle_mode: bool = True,
         single_target_mode: bool = False,
+        detection_noise: float = 0.02,
+        detection_dropout: float = 0.05,
         assets_dir: Path | str | None = None,
+        detector_model: Path | str | None = None,
     ):
         """Initialize Drone Hunter environment.
 
@@ -65,7 +69,11 @@ class DroneHunterEnv(gym.Env):
             max_frames: Maximum frames per episode.
             oracle_mode: If True, use ground truth positions (no detector).
             single_target_mode: If True, only pass most urgent drone (simplified).
+            detection_noise: Noise std for simulated detector (position/size jitter).
+            detection_dropout: Probability of missing a detection per frame.
             assets_dir: Directory containing assets (backgrounds, drones).
+            detector_model: Path to ONNX detector model. If provided, uses real
+                detector instead of simulated one (only in detector mode).
         """
         super().__init__()
 
@@ -77,6 +85,11 @@ class DroneHunterEnv(gym.Env):
         self.height = height
         self.oracle_mode = oracle_mode
         self.single_target_mode = single_target_mode
+        self.detection_noise = detection_noise
+        self.detection_dropout = detection_dropout
+
+        # Kalman tracker for detector mode
+        self.tracker = KalmanTracker(max_age=5, min_hits=2)
 
         # Initialize game state
         self.game_state = GameState(max_frames=max_frames)
@@ -92,6 +105,17 @@ class DroneHunterEnv(gym.Env):
             backgrounds_dir=backgrounds_dir,
             drones_dir=drones_dir,
         )
+
+        # Initialize real detector if model path provided
+        self.detector = None
+        if detector_model is not None:
+            from drone_hunter.detection import NanoDetONNX
+            self.detector = NanoDetONNX(
+                str(detector_model),
+                input_size=(height, width),
+                conf_threshold=0.55,  # Higher threshold for single-class models
+                iou_threshold=0.5,
+            )
 
         # Frame buffer for stacking (only used in multi-drone mode)
         self._frame_buffer: list[np.ndarray] = []
@@ -143,11 +167,150 @@ class DroneHunterEnv(gym.Env):
         self._last_action: int | None = None
         self._last_hit: bool = False
 
+    def _generate_detections(self) -> list[Detection]:
+        """Generate detections using real detector or simulation.
+
+        If a real detector model was provided, renders the current frame
+        and runs inference. Otherwise, generates simulated detections
+        from ground truth with noise.
+
+        Returns:
+            List of Detection objects.
+        """
+        if self.detector is not None:
+            # Use real detector on rendered frame
+            frame = self.renderer.render(self.game_state)
+            return self.detector.detect(frame)
+        else:
+            # Use simulated detector
+            return self._generate_simulated_detections()
+
+    def _generate_simulated_detections(self) -> list[Detection]:
+        """Generate simulated detections from ground truth drones.
+
+        Adds noise to positions and sizes to simulate real detector behavior.
+        Also randomly drops some detections to simulate missed detections.
+
+        Returns:
+            List of Detection objects with noisy measurements.
+        """
+        detections = []
+        rng = np.random.default_rng()
+
+        for drone in self.game_state.drones:
+            # Random dropout (simulate missed detections)
+            if rng.random() < self.detection_dropout:
+                continue
+
+            # Get ground truth bbox
+            x1, y1, x2, y2 = drone.bbox
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+            w = x2 - x1
+            h = y2 - y1
+
+            # Add noise to position and size
+            cx_noisy = cx + rng.normal(0, self.detection_noise)
+            cy_noisy = cy + rng.normal(0, self.detection_noise)
+            w_noisy = w * (1 + rng.normal(0, self.detection_noise * 2))
+            h_noisy = h * (1 + rng.normal(0, self.detection_noise * 2))
+
+            # Clamp to valid ranges
+            cx_noisy = np.clip(cx_noisy, 0, 1)
+            cy_noisy = np.clip(cy_noisy, 0, 1)
+            w_noisy = max(0.01, w_noisy)
+            h_noisy = max(0.01, h_noisy)
+
+            # Confidence based on size (larger = more confident)
+            confidence = min(1.0, 0.5 + h_noisy * 2)
+
+            detections.append(Detection(
+                x=cx_noisy,
+                y=cy_noisy,
+                w=w_noisy,
+                h=h_noisy,
+                confidence=confidence,
+            ))
+
+        return detections
+
+    def _get_tracker_observation(self) -> dict[str, np.ndarray]:
+        """Get observation from Kalman tracker (detector mode).
+
+        Uses tracker-estimated z and vz instead of ground truth.
+
+        Returns:
+            Observation dict with tracker-based features.
+        """
+        # Get active tracks sorted by urgency
+        tracks = self.tracker.get_tracks_for_observation()
+
+        # Features: z, vz, urgency, grid_x_onehot[8], grid_y_onehot[8]
+        features_per_target = 3 + self.grid_size * 2  # 19 for grid_size=8
+        target_obs = np.zeros(features_per_target, dtype=np.float32)
+
+        has_target = 0.0
+
+        if tracks:
+            # Get the #1 most urgent track
+            track = tracks[0]
+            has_target = 1.0
+
+            # Compute grid cell from track position
+            cx, cy = track.center
+            grid_x = min(self.grid_size - 1, max(0, int(cx * self.grid_size)))
+            grid_y = min(self.grid_size - 1, max(0, int(cy * self.grid_size)))
+
+            # Compute urgency from tracker estimates
+            z = track.z
+            vz = track.vz
+
+            if vz < 0:  # Approaching
+                frames_to_impact = z / max(0.001, abs(vz))
+                urgency = 1.0 / (1.0 + frames_to_impact / 50.0)
+            else:
+                urgency = 0.1
+
+            # Fill features
+            target_obs[0] = z
+            target_obs[1] = vz * 10  # Scale for gradient
+            target_obs[2] = urgency
+
+            # One-hot grid_x (positions 3-10)
+            target_obs[3 + grid_x] = 1.0
+
+            # One-hot grid_y (positions 11-18)
+            target_obs[3 + self.grid_size + grid_y] = 1.0
+
+        # Game state (threat_level computed from tracker)
+        max_threat = 0.0
+        for track in tracks:
+            if track.vz < 0:
+                threat = 1.0 - track.z
+                max_threat = max(max_threat, threat)
+
+        game_state_obs = np.array([
+            self.game_state.ammo_fraction,
+            self.game_state.reload_fraction,
+            self.game_state.frame_fraction,
+            max_threat,  # Tracker-based threat level
+            has_target,
+        ], dtype=np.float32)
+
+        return {
+            "target": target_obs,
+            "game_state": game_state_obs,
+        }
+
     def _get_observation(self) -> dict[str, np.ndarray]:
         """Get current observation."""
         if self.single_target_mode:
-            # Simple single-target observation
-            return self.game_state.get_single_target_observation(self.grid_size)
+            if self.oracle_mode:
+                # Oracle mode: use ground truth
+                return self.game_state.get_single_target_observation(self.grid_size)
+            else:
+                # Detector mode: use Kalman tracker estimates
+                return self._get_tracker_observation()
         else:
             # Multi-drone mode with frame stacking
             while len(self._frame_buffer) < self.frame_stack:
@@ -163,7 +326,7 @@ class DroneHunterEnv(gym.Env):
 
     def _get_info(self) -> dict[str, Any]:
         """Get auxiliary info about current state."""
-        return {
+        info = {
             "score": self.game_state.score,
             "hits": self.game_state.hits,
             "misses": self.game_state.misses,
@@ -173,6 +336,14 @@ class DroneHunterEnv(gym.Env):
             "threat_level": self.game_state.threat_level,
             "game_over_reason": self.game_state.game_over_reason,
         }
+
+        # Add tracker info in detector mode
+        if not self.oracle_mode:
+            confirmed_tracks = [t for t in self.tracker.tracks if t.hits >= 2]
+            info["num_tracks"] = len(confirmed_tracks)
+            info["tracker_frame"] = self.tracker.frame_count
+
+        return info
 
     def reset(
         self,
@@ -197,12 +368,20 @@ class DroneHunterEnv(gym.Env):
         # Reset frame buffer
         self._frame_buffer.clear()
 
+        # Reset Kalman tracker
+        self.tracker.reset()
+
         # Reset renderer background
         self.renderer.reset_background()
 
         # Reset tracking
         self._last_action = None
         self._last_hit = False
+
+        # Initial tracker update if in detector mode
+        if not self.oracle_mode:
+            detections = self._generate_detections()
+            self.tracker.update(detections)
 
         # Get initial observation
         observation = self._get_observation()
@@ -256,6 +435,11 @@ class DroneHunterEnv(gym.Env):
 
         # Survival reward
         reward += 0.01
+
+        # Update tracker with new detections (detector mode only)
+        if not self.oracle_mode:
+            detections = self._generate_detections()
+            self.tracker.update(detections)
 
         # Update frame buffer (only in multi-drone mode)
         if not self.single_target_mode:

@@ -25,6 +25,8 @@ def make_env(
     max_frames: int = 1000,
     oracle_mode: bool = True,
     single_target_mode: bool = False,
+    detection_noise: float = 0.02,
+    detection_dropout: float = 0.05,
 ) -> gym.Env:
     """Create a Drone Hunter environment.
 
@@ -34,6 +36,8 @@ def make_env(
         max_frames: Maximum frames per episode.
         oracle_mode: Use ground truth positions.
         single_target_mode: If True, only pass most urgent drone.
+        detection_noise: Noise std for simulated detector (detector mode only).
+        detection_dropout: Probability of missing detection (detector mode only).
 
     Returns:
         Gymnasium environment.
@@ -45,6 +49,8 @@ def make_env(
         max_frames=max_frames,
         oracle_mode=oracle_mode,
         single_target_mode=single_target_mode,
+        detection_noise=detection_noise,
+        detection_dropout=detection_dropout,
     )
 
 
@@ -69,6 +75,9 @@ def train(
     verbose: int = 1,
     single_target_mode: bool = False,
     norm_obs: bool = True,
+    oracle_mode: bool = True,
+    detection_noise: float = 0.02,
+    detection_dropout: float = 0.05,
 ) -> PPO:
     """Train a PPO agent on Drone Hunter.
 
@@ -92,6 +101,9 @@ def train(
         verbose: Verbosity level.
         single_target_mode: If True, use simplified single-target observation.
         norm_obs: If True, normalize observations with VecNormalize.
+        oracle_mode: If True, use ground truth. If False, use Kalman tracker.
+        detection_noise: Noise std for simulated detector (detector mode only).
+        detection_dropout: Probability of missing detection (detector mode only).
 
     Returns:
         Trained PPO model.
@@ -112,6 +124,10 @@ def train(
     print(f"Total timesteps: {total_timesteps:,}")
     print(f"Parallel environments: {n_envs}")
     print(f"Single-target mode: {single_target_mode}")
+    print(f"Oracle mode: {oracle_mode}")
+    if not oracle_mode:
+        print(f"Detection noise: {detection_noise}")
+        print(f"Detection dropout: {detection_dropout}")
     print(f"Observation normalization: {norm_obs}")
     print("-" * 50)
 
@@ -120,8 +136,10 @@ def train(
         return make_env(
             grid_size=grid_size,
             max_frames=max_frames,
-            oracle_mode=True,
+            oracle_mode=oracle_mode,
             single_target_mode=single_target_mode,
+            detection_noise=detection_noise,
+            detection_dropout=detection_dropout,
         )
 
     vec_env = make_vec_env(env_fn, n_envs=n_envs)
@@ -252,6 +270,14 @@ def main() -> None:
     parser.add_argument("--no-norm-obs", action="store_true",
                        help="Disable observation normalization (preserve one-hot encoding)")
 
+    # Detector mode (Kalman tracker instead of oracle)
+    parser.add_argument("--detector-mode", action="store_true",
+                       help="Use detector mode with Kalman tracker (no ground truth)")
+    parser.add_argument("--detection-noise", type=float, default=0.02,
+                       help="Noise std for simulated detector (detector mode only)")
+    parser.add_argument("--detection-dropout", type=float, default=0.05,
+                       help="Probability of missing detection (detector mode only)")
+
     args = parser.parse_args()
 
     train(
@@ -275,6 +301,9 @@ def main() -> None:
         verbose=args.verbose,
         single_target_mode=args.single_target,
         norm_obs=not args.no_norm_obs,
+        oracle_mode=not args.detector_mode,
+        detection_noise=args.detection_noise,
+        detection_dropout=args.detection_dropout,
     )
 
 
