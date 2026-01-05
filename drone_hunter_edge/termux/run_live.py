@@ -163,10 +163,15 @@ def run_live(
 
             start_time = time.time()
 
+            # Timing instrumentation
+            t0 = time.perf_counter()
+
             # Render frame
             frame = renderer.render(game_state)
+            t_render = time.perf_counter() - t0
 
             # Get detections
+            t0 = time.perf_counter()
             if oracle_mode or detector is None:
                 detections = [
                     Detection(
@@ -181,9 +186,12 @@ def run_live(
                 ]
             else:
                 detections = detector.detect(frame)
+            t_detect = time.perf_counter() - t0
 
             # Update tracker
+            t0 = time.perf_counter()
             tracker.update(detections)
+            t_track = time.perf_counter() - t0
 
             # Build observation
             if oracle_mode:
@@ -206,6 +214,7 @@ def run_live(
                 obs = normalizer.normalize(obs)
 
             # Get action
+            t0 = time.perf_counter()
             if policy:
                 action_idx, grid_coords = policy.predict(obs)
             else:
@@ -216,6 +225,7 @@ def run_live(
                     action_idx = np.random.randint(1, grid_size * grid_size + 1)
                     cell_idx = action_idx - 1
                     grid_coords = (cell_idx % grid_size, cell_idx // grid_size)
+            t_policy = time.perf_counter() - t0
 
             # Execute action
             reward = 0.01
@@ -242,6 +252,7 @@ def run_live(
             step += 1
 
             # Render with overlay
+            t0 = time.perf_counter()
             overlay_frame = renderer.render_with_overlay(
                 game_state,
                 grid_size=grid_size,
@@ -281,6 +292,15 @@ def run_live(
                 y_offset += text_surface.get_height() + 2
 
             pygame.display.flip()
+            t_display = time.perf_counter() - t0
+
+            # Print timing every 30 frames
+            if step % 30 == 0:
+                total = t_render + t_detect + t_track + t_policy + t_display
+                fps_est = 1000.0 / (total * 1000) if total > 0 else 0
+                print(f"[{step:4d}] render={t_render*1000:5.1f}ms detect={t_detect*1000:5.1f}ms "
+                      f"track={t_track*1000:4.1f}ms policy={t_policy*1000:4.1f}ms "
+                      f"display={t_display*1000:5.1f}ms | total={total*1000:5.1f}ms ({fps_est:.0f} FPS)")
 
             # Frame rate control
             elapsed = time.time() - start_time
