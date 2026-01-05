@@ -7,8 +7,9 @@ Runs the simulation with real-time pygame display for Termux X11.
 import argparse
 import sys
 import time
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 
@@ -35,6 +36,60 @@ from core.observation import (
 )
 
 
+class AsyncDetector:
+    """Background thread detector for non-blocking inference."""
+
+    def __init__(self, detector):
+        self.detector = detector
+        self.latest_frame: Optional[np.ndarray] = None
+        self.latest_detections: List = []
+        self.running = False
+        self.thread: Optional[threading.Thread] = None
+        self.lock = threading.Lock()
+        self.detection_count = 0
+
+    def start(self):
+        """Start the background detection thread."""
+        self.running = True
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        """Stop the background detection thread."""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+
+    def _worker(self):
+        """Background worker that continuously runs detection."""
+        while self.running:
+            # Grab latest frame
+            with self.lock:
+                frame = self.latest_frame
+
+            if frame is not None:
+                # Run detection (this is the slow part)
+                detections = self.detector.detect(frame)
+
+                # Store results
+                with self.lock:
+                    self.latest_detections = detections
+                    self.detection_count += 1
+            else:
+                # No frame yet, wait a bit
+                time.sleep(0.01)
+
+    def update_frame(self, frame: np.ndarray):
+        """Update the frame for detection (called from main thread)."""
+        with self.lock:
+            self.latest_frame = frame
+
+    def get_detections(self) -> List:
+        """Get latest detections (called from main thread, non-blocking)."""
+        with self.lock:
+            return self.latest_detections
+
+
 def run_live(
     policy_model: Optional[str] = None,
     detector_model: Optional[str] = None,
@@ -46,6 +101,7 @@ def run_live(
     display_scale: int = 2,
     target_fps: int = 30,
     detect_interval: int = 1,
+    async_detect: bool = False,
 ) -> None:
     """Run the drone hunter simulation with live display.
 
@@ -60,6 +116,7 @@ def run_live(
         display_scale: Scale factor for display window.
         target_fps: Target frames per second.
         detect_interval: Run detector every N frames (1=every frame, 2=skip one, etc).
+        async_detect: Run detector in background thread (non-blocking).
     """
     # Initialize components
     game_state = GameState(max_frames=max_frames)
@@ -68,6 +125,7 @@ def run_live(
 
     # Load detector if provided
     detector = None
+    async_detector = None
     if detector_model and not oracle_mode:
         try:
             from inference.nanodet import create_detector
@@ -78,6 +136,12 @@ def run_live(
                 iou_threshold=0.5,
             )
             print(f"Loaded detector: {detector_model} ({backend_type})")
+
+            # Wrap in async detector if enabled
+            if async_detect:
+                async_detector = AsyncDetector(detector)
+                async_detector.start()
+                print("Async detection enabled (background thread)")
         except Exception as e:
             print(f"Warning: Failed to load detector: {e}")
             print("Falling back to oracle mode")
@@ -174,28 +238,33 @@ def run_live(
             frame = renderer.render(game_state)
             t_render = time.perf_counter() - t0
 
-            # Get detections (with optional frame skipping)
+            # Get detections
             t0 = time.perf_counter()
-            run_detection = (step % detect_interval == 0) or oracle_mode or detector is None
 
-            if run_detection:
-                if oracle_mode or detector is None:
-                    detections = [
-                        Detection(
-                            x=d.x,
-                            y=d.y,
-                            w=d.size,
-                            h=d.size,
-                            confidence=1.0,
-                        )
-                        for d in game_state.drones
-                        if d.is_on_screen()
-                    ]
-                else:
-                    detections = detector.detect(frame)
+            if oracle_mode or detector is None:
+                # Oracle mode: use ground truth
+                detections = [
+                    Detection(
+                        x=d.x,
+                        y=d.y,
+                        w=d.size,
+                        h=d.size,
+                        confidence=1.0,
+                    )
+                    for d in game_state.drones
+                    if d.is_on_screen()
+                ]
+            elif async_detector is not None:
+                # Async mode: update frame and get latest results (non-blocking)
+                async_detector.update_frame(frame)
+                detections = async_detector.get_detections()
             else:
-                # Skip detection, use empty list (tracker will predict)
-                detections = []
+                # Sync mode with optional frame skipping
+                run_detection = (step % detect_interval == 0)
+                if run_detection:
+                    detections = detector.detect(frame)
+                else:
+                    detections = []
             t_detect = time.perf_counter() - t0
 
             # Update tracker
@@ -323,6 +392,11 @@ def run_live(
             # Brief pause between episodes
             time.sleep(0.5)
 
+    # Cleanup
+    if async_detector is not None:
+        async_detector.stop()
+        print(f"Async detector ran {async_detector.detection_count} detections")
+
     pygame.quit()
     print("\nSimulation ended.")
 
@@ -373,6 +447,11 @@ def main():
         help="Run detector every N frames (1=every frame, 3=skip 2, etc). "
              "Higher values improve FPS but reduce detection accuracy."
     )
+    parser.add_argument(
+        "--async-detect", action="store_true",
+        help="Run detector in background thread (non-blocking). "
+             "Enables smooth display FPS independent of detection speed."
+    )
 
     args = parser.parse_args()
 
@@ -387,6 +466,7 @@ def main():
         display_scale=args.scale,
         target_fps=args.fps,
         detect_interval=args.detect_interval,
+        async_detect=args.async_detect,
     )
 
 
