@@ -58,6 +58,8 @@ class DroneHunterEnv(gym.Env):
         assets_dir: Path | str | None = None,
         detector_model: Path | str | None = None,
         difficulty: str | DifficultyConfig | None = None,
+        detection_interval_min: int = 1,
+        detection_interval_max: int = 1,
     ):
         """Initialize Drone Hunter environment.
 
@@ -79,6 +81,9 @@ class DroneHunterEnv(gym.Env):
             difficulty: Visual difficulty preset or DifficultyConfig instance.
                 Options: "easy" (default), "medium", "hard", "forest", "urban".
                 Only affects visuals/detector training, not core gameplay.
+            detection_interval_min: Minimum frames between detector runs (for frame skipping).
+            detection_interval_max: Maximum frames between detector runs.
+                If min != max, interval is randomly sampled per episode.
         """
         super().__init__()
 
@@ -100,6 +105,12 @@ class DroneHunterEnv(gym.Env):
         self.single_target_mode = single_target_mode
         self.detection_noise = detection_noise
         self.detection_dropout = detection_dropout
+        self.detection_interval_min = detection_interval_min
+        self.detection_interval_max = detection_interval_max
+
+        # Frame skipping state (initialized in reset)
+        self._detection_interval = 1
+        self._frame_counter = 0
 
         # Kalman tracker for detector mode
         self.tracker = KalmanTracker(max_age=5, min_hits=2)
@@ -363,6 +374,7 @@ class DroneHunterEnv(gym.Env):
             confirmed_tracks = [t for t in self.tracker.tracks if t.hits >= 2]
             info["num_tracks"] = len(confirmed_tracks)
             info["tracker_frame"] = self.tracker.frame_count
+            info["detection_interval"] = self._detection_interval
 
         return info
 
@@ -398,6 +410,17 @@ class DroneHunterEnv(gym.Env):
         # Reset tracking
         self._last_action = None
         self._last_hit = False
+
+        # Sample detection interval for this episode
+        self._frame_counter = 0
+        if self.detection_interval_min == self.detection_interval_max:
+            self._detection_interval = self.detection_interval_min
+        else:
+            # Random interval for this episode
+            self._detection_interval = self.np_random.integers(
+                self.detection_interval_min,
+                self.detection_interval_max + 1
+            )
 
         # Initial tracker update if in detector mode
         if not self.oracle_mode:
@@ -459,8 +482,14 @@ class DroneHunterEnv(gym.Env):
 
         # Update tracker with new detections (detector mode only)
         if not self.oracle_mode:
-            detections = self._generate_detections()
-            self.tracker.update(detections)
+            self._frame_counter += 1
+            # Only run detection every N frames (frame skipping)
+            if self._frame_counter % self._detection_interval == 0:
+                detections = self._generate_detections()
+                self.tracker.update(detections)
+            else:
+                # Predict-only step (no measurement)
+                self.tracker.predict_only()
 
         # Update frame buffer (only in multi-drone mode)
         if not self.single_target_mode:

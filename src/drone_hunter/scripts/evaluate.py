@@ -34,6 +34,7 @@ def evaluate(
     show_gt_boxes: bool = True,
     show_detector_boxes: bool = True,
     difficulty: str | None = None,
+    detection_interval: int = 1,
 ) -> dict:
     """Evaluate a trained model.
 
@@ -51,6 +52,7 @@ def evaluate(
         show_gt_boxes: Show ground truth bounding boxes (green/red)
         show_detector_boxes: Show detector predictions (yellow)
         difficulty: Visual difficulty preset (easy, medium, hard, forest, urban)
+        detection_interval: Frames between detector runs (1=every frame)
 
     Returns:
         Dictionary with evaluation stats
@@ -72,6 +74,8 @@ def evaluate(
             single_target_mode=single_target_mode,
             detector_model=detector_model,
             difficulty=difficulty,
+            detection_interval_min=detection_interval,
+            detection_interval_max=detection_interval,
         )
 
     env = DummyVecEnv([make_env])
@@ -221,6 +225,8 @@ def main():
     parser.add_argument("--difficulty", type=str, default=None,
                        choices=["easy", "medium", "hard", "forest", "urban"],
                        help="Visual difficulty preset")
+    parser.add_argument("--detection-interval", type=int, default=1,
+                       help="Frames between detector runs (1=every frame, 5=skip 4)")
 
     args = parser.parse_args()
 
@@ -238,6 +244,7 @@ def main():
         show_gt_boxes=not args.no_gt_boxes,
         show_detector_boxes=not args.no_detector_boxes,
         difficulty=args.difficulty,
+        detection_interval=args.detection_interval,
     )
 
 

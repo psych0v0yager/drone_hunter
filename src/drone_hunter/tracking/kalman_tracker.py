@@ -350,6 +350,27 @@ class KalmanTracker:
         # Return confirmed tracks only
         return [t for t in self.tracks if t.hits >= self.min_hits]
 
+    def predict_only(self) -> List[DroneTrack]:
+        """Advance all tracks without measurement update.
+
+        Used when skipping detection frames - Kalman filter predicts
+        forward without new measurements.
+
+        Returns:
+            List of confirmed tracks after prediction.
+        """
+        self.frame_count += 1
+
+        for track in self.tracks:
+            track.predict()
+            # Increment misses since no detection available
+            track.misses += 1
+
+        # Remove dead tracks
+        self.tracks = [t for t in self.tracks if t.misses <= self.max_age]
+
+        return [t for t in self.tracks if t.hits >= self.min_hits]
+
     def get_tracks_for_observation(self) -> List[DroneTrack]:
         """Get active tracks suitable for agent observation.
 

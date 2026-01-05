@@ -29,6 +29,8 @@ def make_env(
     detection_dropout: float = 0.05,
     detector_model: str | None = None,
     difficulty: str | None = None,
+    detection_interval_min: int = 1,
+    detection_interval_max: int = 1,
 ) -> gym.Env:
     """Create a Drone Hunter environment.
 
@@ -42,6 +44,8 @@ def make_env(
         detection_dropout: Probability of missing detection (detector mode only).
         detector_model: Path to ONNX detector model (uses real detector instead of simulated).
         difficulty: Visual difficulty preset (easy, medium, hard, forest, urban).
+        detection_interval_min: Min frames between detector runs (for frame skipping).
+        detection_interval_max: Max frames between detector runs.
 
     Returns:
         Gymnasium environment.
@@ -57,6 +61,8 @@ def make_env(
         detection_dropout=detection_dropout,
         detector_model=detector_model,
         difficulty=difficulty,
+        detection_interval_min=detection_interval_min,
+        detection_interval_max=detection_interval_max,
     )
 
 
@@ -87,6 +93,8 @@ def train(
     detector_model: str | None = None,
     resume_path: str | None = None,
     difficulty: str | None = None,
+    detection_interval_min: int = 1,
+    detection_interval_max: int = 1,
 ) -> PPO:
     """Train a PPO agent on Drone Hunter.
 
@@ -116,6 +124,9 @@ def train(
         detector_model: Path to ONNX detector model (uses real detector instead of simulated).
         resume_path: Path to model.zip to resume training from (for fine-tuning).
         difficulty: Visual difficulty preset (easy, medium, hard, forest, urban).
+        detection_interval_min: Min frames between detector runs (for frame skipping).
+        detection_interval_max: Max frames between detector runs. If different from min,
+            interval is randomly sampled per episode.
 
     Returns:
         Trained PPO model.
@@ -143,6 +154,8 @@ def train(
         else:
             print(f"Detection noise: {detection_noise}")
             print(f"Detection dropout: {detection_dropout}")
+        if detection_interval_min != 1 or detection_interval_max != 1:
+            print(f"Detection interval: {detection_interval_min}-{detection_interval_max} frames")
     print(f"Observation normalization: {norm_obs}")
     if difficulty:
         print(f"Visual difficulty: {difficulty}")
@@ -159,6 +172,8 @@ def train(
             detection_dropout=detection_dropout,
             detector_model=detector_model,
             difficulty=difficulty,
+            detection_interval_min=detection_interval_min,
+            detection_interval_max=detection_interval_max,
         )
 
     vec_env = make_vec_env(env_fn, n_envs=n_envs)
@@ -315,6 +330,13 @@ def main() -> None:
                        choices=["easy", "medium", "hard", "forest", "urban"],
                        help="Visual difficulty preset (only affects detector, not gameplay)")
 
+    # Frame skipping (detection interval)
+    parser.add_argument("--detection-interval-min", type=int, default=1,
+                       help="Min frames between detector runs (1=every frame, 5=skip 4)")
+    parser.add_argument("--detection-interval-max", type=int, default=1,
+                       help="Max frames between detector runs. If different from min, "
+                            "interval is randomly sampled per episode")
+
     args = parser.parse_args()
 
     train(
@@ -344,6 +366,8 @@ def main() -> None:
         detector_model=args.detector_model,
         resume_path=args.resume,
         difficulty=args.difficulty,
+        detection_interval_min=args.detection_interval_min,
+        detection_interval_max=args.detection_interval_max,
     )
 
 
