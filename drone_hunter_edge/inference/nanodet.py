@@ -309,6 +309,9 @@ def create_detector(
         iou_threshold: IoU threshold for NMS.
         num_classes: Number of classes (default 1 for drone detection).
         **backend_kwargs: Additional arguments for backend constructor.
+            For ONNX backend:
+                - provider_priority: "auto", "desktop", "mobile", "mobile-npu",
+                  or specific provider like "xnnpack", "nnapi", "cuda", "cpu"
 
     Returns:
         Configured NanoDetDetector instance.

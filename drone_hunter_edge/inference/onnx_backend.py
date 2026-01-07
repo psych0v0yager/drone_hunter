@@ -1,9 +1,13 @@
 """ONNX Runtime inference backend.
 
 Supports CPU execution on Termux, with optional GPU acceleration on desktop.
+Includes mobile execution providers (NNAPI, XNNPACK) for Android devices.
 """
 
-from typing import Tuple, Optional
+import platform
+import sys
+from typing import List, Optional, Tuple, Union
+
 import numpy as np
 
 from inference.backend import InferenceBackend
@@ -16,19 +20,97 @@ except ImportError:
     ONNX_AVAILABLE = False
 
 
+# Provider priority presets
+PROVIDER_PRESETS = {
+    "desktop": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    "mobile": ["XnnpackExecutionProvider", "CPUExecutionProvider"],
+    "mobile-npu": ["NnapiExecutionProvider", "XnnpackExecutionProvider", "CPUExecutionProvider"],
+}
+
+
+def get_execution_providers(
+    priority: Union[str, List[str]] = "auto"
+) -> List[str]:
+    """Get ordered list of available execution providers.
+
+    Args:
+        priority: Provider selection strategy:
+            - "auto": Detect platform (desktop vs mobile)
+            - "desktop": CUDA -> CPU
+            - "mobile": XNNPACK -> CPU (best for budget phones)
+            - "mobile-npu": NNAPI -> XNNPACK -> CPU (for flagships with NPU)
+            - "nnapi", "xnnpack", "cuda", "cpu": Specific provider + CPU fallback
+            - List of providers: Custom order (e.g., ["XnnpackExecutionProvider", "CPUExecutionProvider"])
+
+    Returns:
+        List of available providers in priority order, always ending with CPUExecutionProvider.
+    """
+    if not ONNX_AVAILABLE:
+        return ["CPUExecutionProvider"]
+
+    available = ort.get_available_providers()
+
+    # Handle custom list
+    if isinstance(priority, list):
+        requested = priority
+    # Handle preset names
+    elif priority == "auto":
+        # Detect platform: Android/ARM = mobile, else desktop
+        is_mobile = (
+            "android" in sys.platform.lower()
+            or "TERMUX_VERSION" in __import__("os").environ
+            or platform.machine().lower() in ("aarch64", "arm64", "armv7l")
+        )
+        preset_name = "mobile" if is_mobile else "desktop"
+        requested = PROVIDER_PRESETS[preset_name]
+    elif priority in PROVIDER_PRESETS:
+        requested = PROVIDER_PRESETS[priority]
+    elif priority.lower() in ("nnapi", "xnnpack", "cuda", "cpu"):
+        # Map shorthand to full provider name
+        provider_map = {
+            "nnapi": "NnapiExecutionProvider",
+            "xnnpack": "XnnpackExecutionProvider",
+            "cuda": "CUDAExecutionProvider",
+            "cpu": "CPUExecutionProvider",
+        }
+        requested = [provider_map[priority.lower()], "CPUExecutionProvider"]
+    else:
+        # Unknown preset, fall back to auto
+        requested = PROVIDER_PRESETS["desktop"]
+
+    # Filter to only available providers, always ensure CPU fallback
+    providers = [p for p in requested if p in available]
+    if "CPUExecutionProvider" not in providers:
+        providers.append("CPUExecutionProvider")
+
+    return providers
+
+
 class ONNXBackend(InferenceBackend):
     """ONNX Runtime inference backend.
 
     Automatically selects best available execution provider:
-    - CUDAExecutionProvider (NVIDIA GPU)
-    - CPUExecutionProvider (fallback)
+    - Desktop: CUDAExecutionProvider -> CPUExecutionProvider
+    - Mobile: XnnpackExecutionProvider -> CPUExecutionProvider
+    - Mobile NPU: NnapiExecutionProvider -> XnnpackExecutionProvider -> CPUExecutionProvider
     """
 
-    def __init__(self, use_gpu: bool = True):
+    def __init__(
+        self,
+        use_gpu: bool = True,
+        provider_priority: Union[str, List[str]] = "auto",
+    ):
         """Initialize ONNX backend.
 
         Args:
-            use_gpu: Whether to attempt GPU acceleration.
+            use_gpu: Whether to attempt GPU acceleration (legacy, use provider_priority instead).
+            provider_priority: Provider selection strategy:
+                - "auto": Detect platform (desktop vs mobile)
+                - "desktop": CUDA -> CPU
+                - "mobile": XNNPACK -> CPU (best for budget phones)
+                - "mobile-npu": NNAPI -> XNNPACK -> CPU (for flagships with NPU)
+                - "nnapi", "xnnpack", "cuda", "cpu": Specific provider + CPU fallback
+                - List of providers: Custom order
         """
         if not ONNX_AVAILABLE:
             raise ImportError(
@@ -36,6 +118,7 @@ class ONNXBackend(InferenceBackend):
             )
 
         self.use_gpu = use_gpu
+        self.provider_priority = provider_priority
         self.session: Optional[ort.InferenceSession] = None
         self._input_name: Optional[str] = None
         self._output_name: Optional[str] = None
@@ -48,12 +131,7 @@ class ONNXBackend(InferenceBackend):
         Args:
             model_path: Path to .onnx model file.
         """
-        providers = []
-
-        if self.use_gpu and "CUDAExecutionProvider" in ort.get_available_providers():
-            providers.append("CUDAExecutionProvider")
-
-        providers.append("CPUExecutionProvider")
+        providers = get_execution_providers(self.provider_priority)
 
         # Session options for mobile optimization
         sess_options = ort.SessionOptions()

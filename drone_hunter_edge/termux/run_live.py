@@ -45,6 +45,7 @@ def run_live(
     grid_size: int = 8,
     display_scale: int = 2,
     target_fps: int = 30,
+    provider_priority: str = "auto",
 ) -> None:
     """Run the drone hunter simulation with live display.
 
@@ -58,6 +59,8 @@ def run_live(
         grid_size: Size of firing grid.
         display_scale: Scale factor for display window.
         target_fps: Target frames per second.
+        provider_priority: Execution provider selection:
+            "auto", "desktop", "mobile", "mobile-npu", or specific provider.
     """
     # Initialize components
     game_state = GameState(max_frames=max_frames)
@@ -74,8 +77,11 @@ def run_live(
                 backend_type=backend_type,
                 conf_threshold=0.60,
                 iou_threshold=0.5,
+                provider_priority=provider_priority,
             )
             print(f"Loaded detector: {detector_model} ({backend_type})")
+            if hasattr(detector.backend, 'active_provider'):
+                print(f"  Provider: {detector.backend.active_provider}")
         except Exception as e:
             print(f"Warning: Failed to load detector: {e}")
             print("Falling back to oracle mode")
@@ -90,8 +96,10 @@ def run_live(
                 policy_model,
                 grid_size=grid_size,
                 deterministic=True,
+                provider_priority=provider_priority,
             )
             print(f"Loaded policy: {policy_model}")
+            print(f"  Provider: {policy.active_provider}")
         except Exception as e:
             print(f"Warning: Failed to load policy: {e}")
             print("Using random actions")
@@ -345,6 +353,13 @@ def main():
         "--fps", type=int, default=30,
         help="Target frames per second"
     )
+    parser.add_argument(
+        "--provider", type=str, default="auto",
+        choices=["auto", "desktop", "mobile", "mobile-npu", "nnapi", "xnnpack", "cuda", "cpu"],
+        help="Execution provider: auto (detect platform), desktop (CUDA/CPU), "
+             "mobile (XNNPACK/CPU for budget phones), mobile-npu (NNAPI/XNNPACK/CPU for flagships), "
+             "or specific provider"
+    )
 
     args = parser.parse_args()
 
@@ -358,6 +373,7 @@ def main():
         grid_size=args.grid_size,
         display_scale=args.scale,
         target_fps=args.fps,
+        provider_priority=args.provider,
     )
 
 
