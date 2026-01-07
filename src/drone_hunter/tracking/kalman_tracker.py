@@ -34,15 +34,19 @@ class Detection:
 
 @dataclass
 class DroneTrack:
-    """Single drone track with Kalman filter state for depth estimation.
+    """Single drone track with Kalman filter state for position and depth.
 
-    State vector: [z, vz] where z is depth and vz is depth velocity.
-    Measurement: z estimated from bounding box size.
+    State vector: [x, y, z, vx, vy, vz]
+    - x, y: normalized screen position (0-1)
+    - z: depth (0.1-1.0)
+    - vx, vy, vz: velocities (per frame)
+
+    Measurements: x, y from bbox center, z from bbox height.
     """
     track_id: int
-    x: np.ndarray              # State [z, vz]
-    P: np.ndarray              # Covariance matrix (2x2)
-    bbox: Tuple[float, float, float, float]  # Last (x, y, w, h)
+    state: np.ndarray          # State [x, y, z, vx, vy, vz]
+    P: np.ndarray              # Covariance matrix (6x6)
+    bbox_size: Tuple[float, float]  # Last (w, h) for IoU calculation
     age: int = 0               # Frames since creation
     hits: int = 1              # Consecutive detections
     misses: int = 0            # Consecutive missed detections
@@ -50,69 +54,113 @@ class DroneTrack:
 
     # Kalman filter matrices (shared across all tracks)
     # State transition: constant velocity model
+    # [x, y, z, vx, vy, vz] -> [x+vx, y+vy, z+vz, vx, vy, vz]
     F: np.ndarray = field(default_factory=lambda: np.array([
-        [1, 1],  # z_new = z + vz * dt (dt=1 frame)
-        [0, 1],  # vz_new = vz
+        [1, 0, 0, 1, 0, 0],  # x_new = x + vx
+        [0, 1, 0, 0, 1, 0],  # y_new = y + vy
+        [0, 0, 1, 0, 0, 1],  # z_new = z + vz
+        [0, 0, 0, 1, 0, 0],  # vx_new = vx
+        [0, 0, 0, 0, 1, 0],  # vy_new = vy
+        [0, 0, 0, 0, 0, 1],  # vz_new = vz
     ], dtype=np.float32))
 
-    # Measurement matrix: we observe z only
+    # Measurement matrix: we observe x, y, z
     H: np.ndarray = field(default_factory=lambda: np.array([
-        [1, 0],  # z_measured
+        [1, 0, 0, 0, 0, 0],  # measure x
+        [0, 1, 0, 0, 0, 0],  # measure y
+        [0, 0, 1, 0, 0, 0],  # measure z
     ], dtype=np.float32))
 
     # Process noise (model uncertainty)
+    # Higher noise for velocities since drone motion is less predictable
     Q: np.ndarray = field(default_factory=lambda: np.array([
-        [0.01, 0],
-        [0, 0.001],
+        [0.001, 0, 0, 0, 0, 0],      # x position noise
+        [0, 0.001, 0, 0, 0, 0],      # y position noise
+        [0, 0, 0.01, 0, 0, 0],       # z position noise (depth less certain)
+        [0, 0, 0, 0.005, 0, 0],      # vx noise
+        [0, 0, 0, 0, 0.005, 0],      # vy noise
+        [0, 0, 0, 0, 0, 0.001],      # vz noise
     ], dtype=np.float32))
 
     # Measurement noise (sensor uncertainty)
+    # x, y from bbox center are fairly accurate, z from height less so
     R: np.ndarray = field(default_factory=lambda: np.array([
-        [0.05],  # z measurement variance
+        [0.01, 0, 0],     # x measurement variance
+        [0, 0.01, 0],     # y measurement variance
+        [0, 0, 0.05],     # z measurement variance (depth estimation)
     ], dtype=np.float32))
+
+    @property
+    def x(self) -> float:
+        """Estimated x position (normalized 0-1)."""
+        return float(self.state[0])
+
+    @property
+    def y(self) -> float:
+        """Estimated y position (normalized 0-1)."""
+        return float(self.state[1])
 
     @property
     def z(self) -> float:
         """Estimated depth."""
-        return float(self.x[0])
+        return float(self.state[2])
+
+    @property
+    def vx(self) -> float:
+        """Estimated x velocity."""
+        return float(self.state[3])
+
+    @property
+    def vy(self) -> float:
+        """Estimated y velocity."""
+        return float(self.state[4])
 
     @property
     def vz(self) -> float:
         """Estimated depth velocity."""
-        return float(self.x[1])
+        return float(self.state[5])
 
     @property
     def center(self) -> Tuple[float, float]:
-        """Last known center position."""
-        return (self.bbox[0], self.bbox[1])
+        """Predicted center position (x, y)."""
+        return (self.x, self.y)
+
+    @property
+    def bbox(self) -> Tuple[float, float, float, float]:
+        """Construct bbox from predicted position and last known size."""
+        return (self.x, self.y, self.bbox_size[0], self.bbox_size[1])
 
     def predict(self) -> np.ndarray:
         """Predict next state using constant velocity model.
 
         Returns:
-            Predicted state [z, vz]
+            Predicted state [x, y, z, vx, vy, vz]
         """
-        # State prediction: x' = F @ x
-        self.x = self.F @ self.x
+        # State prediction: state' = F @ state
+        self.state = self.F @ self.state
 
         # Covariance prediction: P' = F @ P @ F^T + Q
         self.P = self.F @ self.P @ self.F.T + self.Q
 
         self.age += 1
-        return self.x
+        return self.state
 
     def update(self, z_measured: float, detection: Detection) -> None:
         """Update state with new measurement.
 
         Args:
-            z_measured: Depth estimated from bounding box
-            detection: The detection used for measurement
+            z_measured: Depth estimated from bounding box height
+            detection: The detection used for measurement (x, y from center)
         """
-        # Measurement
-        z_meas = np.array([[z_measured]], dtype=np.float32)
+        # Measurement vector: [x, y, z]
+        measurement = np.array([
+            [detection.x],
+            [detection.y],
+            [z_measured],
+        ], dtype=np.float32)
 
-        # Innovation (measurement residual): y = z - H @ x
-        y = z_meas - self.H @ self.x
+        # Innovation (measurement residual): y = z - H @ state
+        y = measurement - self.H @ self.state.reshape(-1, 1)
 
         # Innovation covariance: S = H @ P @ H^T + R
         S = self.H @ self.P @ self.H.T + self.R
@@ -120,15 +168,15 @@ class DroneTrack:
         # Kalman gain: K = P @ H^T @ S^-1
         K = self.P @ self.H.T @ np.linalg.inv(S)
 
-        # State update: x = x + K @ y
-        self.x = self.x + (K @ y).flatten()
+        # State update: state = state + K @ y
+        self.state = self.state + (K @ y).flatten()
 
         # Covariance update: P = (I - K @ H) @ P
-        I = np.eye(2, dtype=np.float32)
+        I = np.eye(6, dtype=np.float32)
         self.P = (I - K @ self.H) @ self.P
 
-        # Update bbox and counters
-        self.bbox = (detection.x, detection.y, detection.w, detection.h)
+        # Update bbox size for IoU calculation
+        self.bbox_size = (detection.w, detection.h)
         self.hits += 1
         self.misses = 0
         self.confidence = min(1.0, self.confidence + 0.1)
@@ -325,21 +373,32 @@ class KalmanTracker:
         for det_idx in unmatched_dets:
             det = detections[det_idx]
 
-            # Initial state
+            # Initial state: [x, y, z, vx, vy, vz]
             z_init = self.estimate_depth(det.h)
-            vz_init = 0.0  # No velocity estimate yet
-
-            # Initial covariance (high uncertainty)
-            P_init = np.array([
-                [0.1, 0],
-                [0, 0.1],
+            state_init = np.array([
+                det.x,    # x position from detection
+                det.y,    # y position from detection
+                z_init,   # z estimated from bbox height
+                0.0,      # vx unknown
+                0.0,      # vy unknown
+                0.0,      # vz unknown
             ], dtype=np.float32)
+
+            # Initial covariance (6x6, high uncertainty for velocities)
+            P_init = np.diag([
+                0.01,   # x position variance (pretty certain)
+                0.01,   # y position variance (pretty certain)
+                0.1,    # z variance (less certain from height)
+                0.1,    # vx variance (unknown)
+                0.1,    # vy variance (unknown)
+                0.1,    # vz variance (unknown)
+            ]).astype(np.float32)
 
             track = DroneTrack(
                 track_id=self.next_id,
-                x=np.array([z_init, vz_init], dtype=np.float32),
+                state=state_init,
                 P=P_init,
-                bbox=(det.x, det.y, det.w, det.h),
+                bbox_size=(det.w, det.h),
             )
             self.tracks.append(track)
             self.next_id += 1
