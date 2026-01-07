@@ -180,9 +180,14 @@ def print_results_table(results: Dict[str, Dict[str, Dict]]):
     print()
 
 
-def run_benchmark(iterations: int = 100, warmup: int = 10):
+def run_benchmark(iterations: int = 100, warmup: int = 10, skip_nnapi: bool = False):
     """Run full benchmark suite."""
     print_header()
+
+    # Filter providers if skipping NNAPI
+    providers_to_test = {k: v for k, v in PROVIDERS.items() if not (skip_nnapi and k == "NNAPI")}
+    if skip_nnapi:
+        print("Skipping NNAPI (--skip-nnapi)\n")
 
     # Find model directory
     script_dir = Path(__file__).parent.parent
@@ -195,13 +200,13 @@ def run_benchmark(iterations: int = 100, warmup: int = 10):
 
         if not model_path.exists():
             print(f"[SKIP] {precision}: Model not found at {model_path}")
-            results[precision] = {p: {"error": "Model not found"} for p in PROVIDERS}
+            results[precision] = {p: {"error": "Model not found"} for p in providers_to_test}
             continue
 
         print(f"\n[TEST] {precision}: {model_path.name}")
         results[precision] = {}
 
-        for provider_name, provider_list in PROVIDERS.items():
+        for provider_name, provider_list in providers_to_test.items():
             print(f"  - {provider_name}...", end=" ", flush=True)
 
             # Check if provider is available
@@ -268,12 +273,18 @@ def main():
         default=10,
         help="Number of warmup iterations (default: 10)"
     )
+    parser.add_argument(
+        "--skip-nnapi",
+        action="store_true",
+        help="Skip NNAPI provider (slow on some devices)"
+    )
 
     args = parser.parse_args()
 
     run_benchmark(
         iterations=args.iterations,
         warmup=args.warmup,
+        skip_nnapi=args.skip_nnapi,
     )
 
 
