@@ -153,24 +153,30 @@ class ONNXBackend(InferenceBackend):
         self._input_shape = tuple(input_info.shape)
         self._output_shape = tuple(output_info.shape)
 
+        # Detect input dtype for FP16 model support
+        # INT8 models use float32 I/O (quantization is internal)
+        self._input_dtype = np.float16 if "float16" in input_info.type else np.float32
+
     def run(self, input_tensor: np.ndarray) -> np.ndarray:
         """Run inference.
 
         Args:
-            input_tensor: Input of shape (1, C, H, W), float32.
+            input_tensor: Input of shape (1, C, H, W), any float type.
 
         Returns:
-            Model output tensor.
+            Model output tensor (always float32 for downstream consistency).
         """
         if self.session is None:
             raise RuntimeError("Model not loaded. Call load() first.")
 
+        # Cast to model's expected dtype (float16 for FP16 models, float32 otherwise)
         outputs = self.session.run(
             [self._output_name],
-            {self._input_name: input_tensor.astype(np.float32)},
+            {self._input_name: input_tensor.astype(self._input_dtype)},
         )
 
-        return outputs[0]
+        # Always return float32 for downstream consistency
+        return outputs[0].astype(np.float32)
 
     def get_input_shape(self) -> Tuple[int, int, int, int]:
         """Get input shape (N, C, H, W)."""
