@@ -46,6 +46,7 @@ def run_live(
     display_scale: int = 2,
     target_fps: int = 30,
     detect_interval: int = 1,
+    provider_priority: str = "auto",
 ) -> None:
     """Run the drone hunter simulation with live display.
 
@@ -60,6 +61,8 @@ def run_live(
         display_scale: Scale factor for display window.
         target_fps: Target frames per second.
         detect_interval: Run detector every N frames (1=every frame, 2=skip one, etc).
+        provider_priority: Execution provider selection:
+            "auto", "desktop", "mobile", "mobile-npu", or specific provider.
     """
     # Initialize components
     game_state = GameState(max_frames=max_frames)
@@ -76,8 +79,11 @@ def run_live(
                 backend_type=backend_type,
                 conf_threshold=0.60,
                 iou_threshold=0.5,
+                provider_priority=provider_priority,
             )
             print(f"Loaded detector: {detector_model} ({backend_type})")
+            if hasattr(detector.backend, 'active_provider'):
+                print(f"  Provider: {detector.backend.active_provider}")
         except Exception as e:
             print(f"Warning: Failed to load detector: {e}")
             print("Falling back to oracle mode")
@@ -92,8 +98,10 @@ def run_live(
                 policy_model,
                 grid_size=grid_size,
                 deterministic=True,
+                provider_priority=provider_priority,
             )
             print(f"Loaded policy: {policy_model}")
+            print(f"  Provider: {policy.active_provider}")
         except Exception as e:
             print(f"Warning: Failed to load policy: {e}")
             print("Using random actions")
@@ -373,6 +381,13 @@ def main():
         help="Run detector every N frames (1=every frame, 3=skip 2, etc). "
              "Higher values improve FPS but reduce detection accuracy."
     )
+    parser.add_argument(
+        "--provider", type=str, default="auto",
+        choices=["auto", "desktop", "mobile", "mobile-npu", "nnapi", "xnnpack", "cuda", "cpu"],
+        help="Execution provider: auto (detect platform), desktop (CUDA/CPU), "
+             "mobile (XNNPACK/CPU for budget phones), mobile-npu (NNAPI/XNNPACK/CPU for flagships), "
+             "or specific provider"
+    )
 
     args = parser.parse_args()
 
@@ -387,6 +402,7 @@ def main():
         display_scale=args.scale,
         target_fps=args.fps,
         detect_interval=args.detect_interval,
+        provider_priority=args.provider,
     )
 
 

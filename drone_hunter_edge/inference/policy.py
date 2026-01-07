@@ -3,10 +3,12 @@
 Supports ONNX-exported policies from Stable Baselines3.
 """
 
-from typing import Dict, Tuple, Optional
+from typing import Dict, List, Optional, Tuple, Union
+
 import numpy as np
 
 from inference.backend import InferenceBackend
+from inference.onnx_backend import get_execution_providers
 
 
 class PolicyInference:
@@ -122,6 +124,7 @@ class SimplePolicyInference:
         model_path: str,
         grid_size: int = 8,
         deterministic: bool = True,
+        provider_priority: Union[str, List[str]] = "auto",
     ):
         """Initialize with ONNX model path.
 
@@ -129,6 +132,13 @@ class SimplePolicyInference:
             model_path: Path to ONNX policy model.
             grid_size: Size of firing grid (default 8x8 = 64 fire positions + 1 wait = 65).
             deterministic: Take argmax if True.
+            provider_priority: Provider selection strategy:
+                - "auto": Detect platform (desktop vs mobile)
+                - "desktop": CUDA -> CPU
+                - "mobile": XNNPACK -> CPU (best for budget phones)
+                - "mobile-npu": NNAPI -> XNNPACK -> CPU (for flagships with NPU)
+                - "nnapi", "xnnpack", "cuda", "cpu": Specific provider + CPU fallback
+                - List of providers: Custom order
         """
         try:
             import onnxruntime as ort
@@ -139,6 +149,9 @@ class SimplePolicyInference:
         self.num_actions = grid_size * grid_size + 1  # 64 fire + 1 wait
         self.deterministic = deterministic
 
+        # Get execution providers based on priority
+        providers = get_execution_providers(provider_priority)
+
         # Load model
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -146,11 +159,16 @@ class SimplePolicyInference:
         self.session = ort.InferenceSession(
             model_path,
             sess_options=sess_options,
-            providers=["CPUExecutionProvider"],
+            providers=providers,
         )
 
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
+
+    @property
+    def active_provider(self) -> str:
+        """Get the active execution provider."""
+        return self.session.get_providers()[0]
 
     def predict(self, obs: Dict[str, np.ndarray]) -> Tuple[int, Optional[Tuple[int, int]]]:
         """Get action from observation.
