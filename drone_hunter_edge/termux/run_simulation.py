@@ -40,6 +40,8 @@ def run_simulation(
     output_dir: Optional[str] = None,
     save_interval: int = 50,
     verbose: bool = True,
+    detect_interval: int = 1,
+    provider_priority: str = "auto",
 ) -> dict:
     """Run the drone hunter simulation.
 
@@ -56,6 +58,8 @@ def run_simulation(
         output_dir: Directory for output frames.
         save_interval: Save frame every N steps.
         verbose: Print progress information.
+        detect_interval: Run detector every N frames (1=every frame).
+        provider_priority: Execution provider selection.
 
     Returns:
         Dictionary with episode statistics.
@@ -75,9 +79,12 @@ def run_simulation(
                 backend_type=backend_type,
                 conf_threshold=0.60,
                 iou_threshold=0.5,
+                provider_priority=provider_priority,
             )
             if verbose:
                 print(f"Loaded detector: {detector_model} ({backend_type})")
+                if hasattr(detector.backend, 'active_provider'):
+                    print(f"  Provider: {detector.backend.active_provider}")
         except Exception as e:
             print(f"Warning: Failed to load detector: {e}")
             print("Falling back to oracle mode")
@@ -92,9 +99,11 @@ def run_simulation(
                 policy_model,
                 grid_size=grid_size,
                 deterministic=True,
+                provider_priority=provider_priority,
             )
             if verbose:
                 print(f"Loaded policy: {policy_model}")
+                print(f"  Provider: {policy.active_provider}")
         except Exception as e:
             print(f"Warning: Failed to load policy: {e}")
             print("Using random actions")
@@ -121,7 +130,16 @@ def run_simulation(
         "hits": [],
         "misses": [],
         "lengths": [],
+        "timing": {
+            "render": [],
+            "detect": [],
+            "track": [],
+            "policy": [],
+        },
     }
+
+    if verbose and detect_interval > 1:
+        print(f"Detection interval: every {detect_interval} frames (frame skipping enabled)")
 
     for episode in range(num_episodes):
         # Reset for new episode
@@ -136,29 +154,43 @@ def run_simulation(
             print(f"\n--- Episode {episode + 1}/{num_episodes} ---")
 
         while not game_state.game_over:
+            # Timing instrumentation
+            t0 = time.time()
+
             # Render frame
             frame = renderer.render(game_state)
+            t_render = time.time() - t0
 
-            # Get detections
-            if oracle_mode or detector is None:
-                # Oracle mode: use ground truth
-                detections = [
-                    Detection(
-                        x=d.x,
-                        y=d.y,
-                        w=d.size,
-                        h=d.size,
-                        confidence=1.0,
-                    )
-                    for d in game_state.drones
-                    if d.is_on_screen()
-                ]
+            # Get detections (with optional frame skipping)
+            t0 = time.time()
+            run_detection = (step % detect_interval == 0) or oracle_mode or detector is None
+
+            if run_detection:
+                if oracle_mode or detector is None:
+                    # Oracle mode: use ground truth
+                    detections = [
+                        Detection(
+                            x=d.x,
+                            y=d.y,
+                            w=d.size,
+                            h=d.size,
+                            confidence=1.0,
+                        )
+                        for d in game_state.drones
+                        if d.is_on_screen()
+                    ]
+                else:
+                    # Detector mode: run NanoDet
+                    detections = detector.detect(frame)
             else:
-                # Detector mode: run NanoDet
-                detections = detector.detect(frame)
+                # Skip detection, tracker will predict
+                detections = []
+            t_detect = time.time() - t0
 
             # Update tracker
+            t0 = time.time()
             tracker.update(detections)
+            t_track = time.time() - t0
 
             # Build observation
             if oracle_mode:
@@ -183,6 +215,7 @@ def run_simulation(
 
             # Get action
             # Discrete(65): 0 = wait, 1-64 = fire at grid position
+            t0 = time.time()
             if policy:
                 action_idx, grid_coords = policy.predict(obs)
             else:
@@ -194,6 +227,13 @@ def run_simulation(
                     action_idx = np.random.randint(1, grid_size * grid_size + 1)
                     cell_idx = action_idx - 1
                     grid_coords = (cell_idx % grid_size, cell_idx // grid_size)
+            t_policy = time.time() - t0
+
+            # Collect timing stats
+            all_stats["timing"]["render"].append(t_render)
+            all_stats["timing"]["detect"].append(t_detect)
+            all_stats["timing"]["track"].append(t_track)
+            all_stats["timing"]["policy"].append(t_policy)
 
             # Execute action
             reward = 0.01  # Survival reward per frame
@@ -258,6 +298,26 @@ def run_simulation(
         total_hits = sum(all_stats["hits"])
         total_misses = sum(all_stats["misses"])
         print(f"Overall Hit Rate: {total_hits / max(1, total_hits + total_misses):.1%}")
+
+        # Timing summary
+        if all_stats["timing"]["render"]:
+            print(f"\n{'=' * 50}")
+            print("TIMING BREAKDOWN (ms)")
+            print(f"{'=' * 50}")
+            print(f"Render:  {np.mean(all_stats['timing']['render'])*1000:6.2f} ms (avg)")
+            print(f"Detect:  {np.mean(all_stats['timing']['detect'])*1000:6.2f} ms (avg)")
+            print(f"Track:   {np.mean(all_stats['timing']['track'])*1000:6.2f} ms (avg)")
+            print(f"Policy:  {np.mean(all_stats['timing']['policy'])*1000:6.2f} ms (avg)")
+            total_time = (
+                np.mean(all_stats['timing']['render']) +
+                np.mean(all_stats['timing']['detect']) +
+                np.mean(all_stats['timing']['track']) +
+                np.mean(all_stats['timing']['policy'])
+            )
+            print(f"Total:   {total_time*1000:6.2f} ms/frame")
+            print(f"Est FPS: {1.0/total_time:.1f}")
+            if detect_interval > 1:
+                print(f"\n(Detection running every {detect_interval} frames)")
         print(f"{'=' * 50}")
 
     return all_stats
@@ -312,6 +372,18 @@ def main():
         "--quiet", action="store_true",
         help="Suppress output"
     )
+    parser.add_argument(
+        "--detect-interval", type=int, default=1,
+        help="Run detector every N frames (1=every frame, 3=skip 2, etc). "
+             "Higher values improve FPS but reduce detection accuracy."
+    )
+    parser.add_argument(
+        "--provider", type=str, default="auto",
+        choices=["auto", "desktop", "mobile", "mobile-npu", "nnapi", "xnnpack", "cuda", "cpu"],
+        help="Execution provider: auto (detect platform), desktop (CUDA/CPU), "
+             "mobile (XNNPACK/CPU for budget phones), mobile-npu (NNAPI/XNNPACK/CPU for flagships), "
+             "or specific provider"
+    )
 
     args = parser.parse_args()
 
@@ -330,6 +402,8 @@ def main():
         output_dir=args.output_dir,
         save_interval=args.save_interval,
         verbose=not args.quiet,
+        detect_interval=args.detect_interval,
+        provider_priority=args.provider,
     )
 
     elapsed = time.time() - start_time
