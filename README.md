@@ -2,7 +2,7 @@
 
 An autonomous drone defense system using reinforcement learning. The AI agent learns to identify and shoot down incoming drones, prioritizing kamikaze threats that fly directly toward the camera.
 
-**Key Achievement**: The trained agent achieves +91.66 reward, exceeding both human-level performance (~60 points) and the oracle baseline (+80.9).
+**Key Achievement**: The trained agent achieves +91.66 reward on easy difficulty, exceeding both human-level performance (~60 points) and the oracle baseline (+80.9). Recent work on hard difficulty (with distractors, weather, and scene variation) shows +46 reward at only 320k steps.
 
 ---
 
@@ -13,9 +13,10 @@ An autonomous drone defense system using reinforcement learning. The AI agent le
 3. [Core Concepts](#core-concepts)
 4. [Environment Design](#environment-design)
 5. [Development Journey](#development-journey)
-6. [Codebase Structure](#codebase-structure)
-7. [Usage Guide](#usage-guide)
-8. [Key Takeaways](#key-takeaways)
+6. [Recent Developments](#recent-developments)
+7. [Codebase Structure](#codebase-structure)
+8. [Usage Guide](#usage-guide)
+9. [Key Takeaways](#key-takeaways)
 
 ---
 
@@ -102,24 +103,24 @@ PPO is a popular RL algorithm that balances exploration (trying new things) with
 
 The Kalman filter estimates hidden state from noisy measurements. Think of it as "smart averaging" that understands physics.
 
-**The problem**: Object detectors give us bounding boxes (x, y, width, height), but we need depth (z) and velocity (vz) to prioritize threats.
+**The problem**: Object detectors give us bounding boxes (x, y, width, height), but we need depth (z) and velocity to prioritize threats.
 
-**The solution**:
-1. Estimate depth from bounding box size (bigger = closer)
-2. Track depth over time to estimate velocity
-3. Use physics model (constant velocity) to smooth estimates
+**The solution**: A 6-state Kalman filter that tracks full 3D position and velocity:
 
 ```
-State: [z, vz]  (depth and depth-velocity)
+State: [x, y, z, vx, vy, vz]
 
-Prediction step:
-  z_predicted = z + vz * dt
-  vz_predicted = vz
+Prediction step (constant velocity model):
+  x_new = x + vx,  y_new = y + vy,  z_new = z + vz
+  velocities unchanged
 
 Update step:
-  z_measured = reference_z * (reference_height / bbox_height)
-  z_new = weighted_average(z_predicted, z_measured)
+  x, y from bbox center
+  z estimated from bbox height (bigger = closer)
+  Kalman gain weights prediction vs measurement by uncertainty
 ```
+
+**Why 6 states?** The original 2-state filter `[z, vz]` couldn't predict x/y positions during frame skipping. With 6 states, the filter predicts where drones *will be*, not just where they *were*.
 
 The Kalman filter's key insight: combine predictions (what physics says should happen) with measurements (what we observe) based on their respective uncertainties.
 
@@ -278,6 +279,67 @@ Performance:           -7.17 → +82.2 reward
 
 ---
 
+## Recent Developments
+
+### Visual Difficulty System
+
+Training now supports multiple difficulty presets that affect only the detector (not gameplay):
+
+| Difficulty | Scene | Distractors | Weather | Use Case |
+|------------|-------|-------------|---------|----------|
+| **Easy** | Clear sky | None | None | Baseline training |
+| **Medium** | Random lighting | Birds, debris | None | Initial robustness |
+| **Hard** | Random scene | All types | Rain, fog | Maximum challenge |
+| **Forest** | Woodland | Birds | None | Natural environments |
+| **Urban** | City/suburban | Birds, planes | None | Powerline confusion |
+
+Hard difficulty includes: random scenes (sky/forest/urban), random lighting (day/golden_hour/overcast/dusk/night/thermal/night_vision), all distractors (birds, debris, balloons, planes), static obstacles (trees, powerlines), and weather effects (rain, fog).
+
+### 6-State Kalman Filter
+
+Upgraded from 2-state `[z, vz]` to 6-state `[x, y, z, vx, vy, vz]`:
+
+- **Problem**: Original filter couldn't predict x/y during frame skipping
+- **Solution**: Full 3D position and velocity tracking
+- **Benefit**: Enables frame skipping for edge deployment (run detector every N frames)
+
+### Frame Skipping for Edge Deployment
+
+For resource-constrained devices, run detection every N frames while Kalman predicts between:
+
+```bash
+# Skip 3 frames (detect every 4th frame)
+uv run python -m drone_hunter.scripts.train \
+  --detection-interval-min 4 --detection-interval-max 4 \
+  --detector-mode --single-target
+```
+
+The 6-state Kalman filter predicts positions forward, so the agent sees estimated positions even during skip frames.
+
+### Hard Difficulty Training (In Progress)
+
+Training on hard difficulty with the v2 detector shows promising early results:
+
+| Model | Architecture | Steps | Eval Reward | Notes |
+|-------|--------------|-------|-------------|-------|
+| detector_hard_v1 | [256, 256] | 320k | **+46.3** | Strong performance |
+| detector_hard_deep_v1 | [512, 512, 256, 256] | 320k | +6.3 | Slower convergence |
+
+The standard architecture is surprisingly effective even with full visual complexity. Training continues to 1.5M steps.
+
+### Experimental: Continuous Observations
+
+Branch `continuous-xy` experiments with replacing one-hot grid encoding with continuous coordinates:
+
+| Encoding | Features | Description |
+|----------|----------|-------------|
+| One-hot grid | 24 | grid_x[8] + grid_y[8] + z + vz + urgency + game_state[5] |
+| Continuous | 12 | x + y + z + vx + vy + vz + urgency + game_state[5] |
+
+Benefits: Enables proper VecNormalize, finer position resolution, smaller observation space.
+
+---
+
 ## Codebase Structure
 
 ```
@@ -404,6 +466,12 @@ tensorboard --logdir runs/my_experiment/tensorboard
 | `--single-target` | True | Single-target observation |
 | `--n-envs` | 4 | Parallel environments |
 | `--learning-rate` | 3e-4 | PPO learning rate |
+| `--difficulty` | easy | Visual difficulty (easy/medium/hard/forest/urban) |
+| `--detector-model` | None | Path to ONNX detector model |
+| `--detection-interval-min` | 1 | Min frames between detections (frame skipping) |
+| `--detection-interval-max` | 1 | Max frames between detections |
+| `--net-arch` | 256 256 | Policy network hidden layers |
+| `--resume` | None | Path to model.zip for fine-tuning |
 
 ---
 
@@ -418,6 +486,12 @@ tensorboard --logdir runs/my_experiment/tensorboard
 4. **Extended training matters**: Detector mode took longer to converge (400k vs 250k steps) but ultimately achieved higher performance with extended training.
 
 5. **Systematic ablation**: Each experiment tested one hypothesis. This methodical approach revealed that the multi-target failure was due to observation complexity, not network capacity.
+
+6. **Bigger isn't always better**: The standard [256, 256] architecture outperforms [512, 512, 256, 256] on hard difficulty in early training. Right-sized networks converge faster.
+
+7. **6-state Kalman enables frame skipping**: Upgrading from `[z, vz]` to `[x, y, z, vx, vy, vz]` allows predicting positions during skipped frames, critical for edge deployment.
+
+8. **Visual difficulty generalizes well**: Training on hard difficulty (with distractors, weather, scene variation) shows strong results (+46 at 320k steps), suggesting the policy learns robust behavior across conditions.
 
 ---
 
