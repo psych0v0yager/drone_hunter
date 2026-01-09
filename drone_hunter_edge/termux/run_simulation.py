@@ -248,12 +248,14 @@ def run_simulation(
 
             # Update tracker
             t0 = time.time()
-            if detections is None:
-                # Tier 0: Just advance predictions, don't penalize tracks
+            if detections is None and scheduler is not None:
+                # Adaptive Tier 0: Just advance predictions, don't penalize tracks
                 confirmed_tracks = tracker.predict_only()
             else:
-                # Tier 1/2: Full update with detection verification
-                confirmed_tracks = tracker.update(detections)
+                # Tier 1/2, or skip-N mode: Full update with detection verification
+                # Note: skip-N passes [] which penalizes tracks, but the policy
+                # was trained expecting this behavior (tracks invisible on skip frames)
+                confirmed_tracks = tracker.update(detections if detections else [])
             t_track = time.time() - t0
 
             # Update scheduler with track count (for has_active_tracks state)
