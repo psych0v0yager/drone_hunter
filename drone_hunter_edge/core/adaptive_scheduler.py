@@ -25,8 +25,9 @@ from core.tiny_detector import TinyDetector
 
 # Uncertainty thresholds (tuned empirically via benchmark_uncertainty.py)
 # These are trace(P[:3,:3]) values from the Kalman filter
-UNCERTAINTY_LOW = 0.1    # Below this: coast on prediction
-UNCERTAINTY_HIGH = 0.3   # Above this: must run full detection
+# Mean uncertainty ~1.7, so thresholds set around that
+UNCERTAINTY_LOW = 2.0    # Below this: coast on prediction
+UNCERTAINTY_HIGH = 5.0   # Above this: must run full detection
 
 
 class AdaptiveScheduler:
