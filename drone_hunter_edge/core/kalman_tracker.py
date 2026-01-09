@@ -244,6 +244,15 @@ class DroneTrack:
         self.hits = 0
         self.confidence = max(0.0, self.confidence - 0.2)
 
+    def get_position_uncertainty(self) -> float:
+        """Scalar uncertainty from position covariance.
+
+        Returns the trace of the position submatrix of P (x, y, z variances).
+        Higher values indicate less certainty about the track's position.
+        Used by adaptive scheduler to decide when to run detection.
+        """
+        return float(np.trace(self.P[:3, :3]))
+
 
 class KalmanTracker:
     """Multi-object tracker using Kalman filters for depth estimation."""
@@ -411,3 +420,24 @@ class KalmanTracker:
                 return 0.1
 
         return sorted(confirmed, key=lambda t: -urgency(t))
+
+    def get_max_uncertainty(self) -> float:
+        """Get highest uncertainty across all tracks.
+
+        Returns 1.0 if no tracks exist (high uncertainty = need detection).
+        Used by adaptive scheduler to trigger detection when prediction
+        confidence is low.
+        """
+        if not self.tracks:
+            return 1.0  # No tracks = high uncertainty, need detection
+        return max(t.get_position_uncertainty() for t in self.tracks)
+
+    def get_mean_uncertainty(self) -> float:
+        """Get mean uncertainty across all tracks.
+
+        Returns 1.0 if no tracks exist.
+        Alternative to get_max_uncertainty() for smoother scheduling.
+        """
+        if not self.tracks:
+            return 1.0
+        return sum(t.get_position_uncertainty() for t in self.tracks) / len(self.tracks)

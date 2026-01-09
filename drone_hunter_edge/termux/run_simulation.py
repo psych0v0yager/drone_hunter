@@ -25,6 +25,7 @@ from core.observation import (
     build_tracker_observation,
     build_oracle_observation,
 )
+from core.adaptive_scheduler import AdaptiveScheduler, calibrate_device
 
 
 def run_simulation(
@@ -42,6 +43,8 @@ def run_simulation(
     verbose: bool = True,
     detect_interval: int = 1,
     provider_priority: str = "auto",
+    adaptive_mode: bool = False,
+    adaptive_base_skip: Optional[int] = None,
 ) -> dict:
     """Run the drone hunter simulation.
 
@@ -58,8 +61,10 @@ def run_simulation(
         output_dir: Directory for output frames.
         save_interval: Save frame every N steps.
         verbose: Print progress information.
-        detect_interval: Run detector every N frames (1=every frame).
+        detect_interval: Run detector every N frames (1=every frame, ignored if adaptive).
         provider_priority: Execution provider selection.
+        adaptive_mode: Use adaptive scheduler instead of fixed detect_interval.
+        adaptive_base_skip: Override base_skip for adaptive mode (None=auto-calibrate).
 
     Returns:
         Dictionary with episode statistics.
@@ -118,6 +123,24 @@ def run_simulation(
         except Exception as e:
             print(f"Warning: Failed to load normalizer: {e}")
 
+    # Initialize adaptive scheduler if enabled
+    scheduler = None
+    if adaptive_mode and not oracle_mode:
+        if adaptive_base_skip is not None:
+            scheduler = AdaptiveScheduler(base_skip=adaptive_base_skip)
+            if verbose:
+                print(f"Adaptive mode enabled (base_skip={adaptive_base_skip})")
+        elif detector is not None:
+            # Auto-calibrate based on device speed
+            base_skip, latency_ms = calibrate_device(detector)
+            scheduler = AdaptiveScheduler(base_skip=base_skip)
+            if verbose:
+                print(f"Adaptive mode enabled (auto-calibrated: {latency_ms:.1f}ms -> base_skip={base_skip})")
+        else:
+            scheduler = AdaptiveScheduler(base_skip=3)
+            if verbose:
+                print("Adaptive mode enabled (default base_skip=3)")
+
     # Setup output directory
     if render_output and output_dir:
         output_path = Path(output_dir)
@@ -136,9 +159,13 @@ def run_simulation(
             "track": [],
             "policy": [],
         },
+        "adaptive": {
+            "tier_counts": {0: 0, 1: 0, 2: 0},
+            "uncertainties": [],
+        },
     }
 
-    if verbose and detect_interval > 1:
+    if verbose and detect_interval > 1 and scheduler is None:
         print(f"Detection interval: every {detect_interval} frames (frame skipping enabled)")
 
     for episode in range(num_episodes):
@@ -146,6 +173,8 @@ def run_simulation(
         game_state.reset()
         renderer.reset_background()
         tracker.reset()
+        if scheduler is not None:
+            scheduler.reset()
 
         episode_reward = 0.0
         step = 0
@@ -161,9 +190,18 @@ def run_simulation(
             frame = renderer.render(game_state)
             t_render = time.time() - t0
 
-            # Get detections (with optional frame skipping)
+            # Get detections (with optional frame skipping or adaptive scheduling)
             t0 = time.time()
-            run_detection = (step % detect_interval == 0) or oracle_mode or detector is None
+
+            if scheduler is not None:
+                # Adaptive mode: use scheduler to decide detection tier
+                kalman_uncertainty = tracker.get_max_uncertainty()
+                detection_tier = scheduler.get_detection_tier(frame, kalman_uncertainty)
+                run_detection = detection_tier >= 2  # Tier 2 = full detection
+            else:
+                # Fixed interval mode
+                run_detection = (step % detect_interval == 0) or oracle_mode or detector is None
+                detection_tier = 2 if run_detection else 0
 
             if run_detection:
                 if oracle_mode or detector is None:
@@ -234,6 +272,11 @@ def run_simulation(
             all_stats["timing"]["detect"].append(t_detect)
             all_stats["timing"]["track"].append(t_track)
             all_stats["timing"]["policy"].append(t_policy)
+
+            # Collect adaptive stats
+            if scheduler is not None:
+                all_stats["adaptive"]["tier_counts"][detection_tier] += 1
+                all_stats["adaptive"]["uncertainties"].append(kalman_uncertainty)
 
             # Execute action
             reward = 0.01  # Survival reward per frame
@@ -316,8 +359,27 @@ def run_simulation(
             )
             print(f"Total:   {total_time*1000:6.2f} ms/frame")
             print(f"Est FPS: {1.0/total_time:.1f}")
-            if detect_interval > 1:
+            if detect_interval > 1 and scheduler is None:
                 print(f"\n(Detection running every {detect_interval} frames)")
+
+        # Adaptive scheduler stats
+        if scheduler is not None and all_stats["adaptive"]["uncertainties"]:
+            print(f"\n{'=' * 50}")
+            print("ADAPTIVE SCHEDULER STATS")
+            print(f"{'=' * 50}")
+            tier_counts = all_stats["adaptive"]["tier_counts"]
+            total_frames = sum(tier_counts.values())
+            print(f"Tier 0 (skip):  {tier_counts[0]:5d} ({tier_counts[0]/total_frames*100:5.1f}%)")
+            print(f"Tier 1 (tiny):  {tier_counts[1]:5d} ({tier_counts[1]/total_frames*100:5.1f}%)")
+            print(f"Tier 2 (full):  {tier_counts[2]:5d} ({tier_counts[2]/total_frames*100:5.1f}%)")
+            detection_rate = (tier_counts[1] + tier_counts[2]) / total_frames * 100
+            print(f"Detection rate: {detection_rate:.1f}%")
+
+            uncertainties = all_stats["adaptive"]["uncertainties"]
+            print(f"\nUncertainty: mean={np.mean(uncertainties):.3f} "
+                  f"std={np.std(uncertainties):.3f} "
+                  f"max={np.max(uncertainties):.3f}")
+
         print(f"{'=' * 50}")
 
     return all_stats
@@ -384,6 +446,15 @@ def main():
              "mobile (XNNPACK/CPU for budget phones), mobile-npu (NNAPI/XNNPACK/CPU for flagships), "
              "or specific provider"
     )
+    parser.add_argument(
+        "--adaptive", action="store_true",
+        help="Use adaptive scheduler instead of fixed detect-interval. "
+             "Dynamically adjusts detection based on Kalman uncertainty and motion."
+    )
+    parser.add_argument(
+        "--adaptive-base-skip", type=int, default=None,
+        help="Override base_skip for adaptive mode (default: auto-calibrate based on device speed)"
+    )
 
     args = parser.parse_args()
 
@@ -404,6 +475,8 @@ def main():
         verbose=not args.quiet,
         detect_interval=args.detect_interval,
         provider_priority=args.provider,
+        adaptive_mode=args.adaptive,
+        adaptive_base_skip=args.adaptive_base_skip,
     )
 
     elapsed = time.time() - start_time
