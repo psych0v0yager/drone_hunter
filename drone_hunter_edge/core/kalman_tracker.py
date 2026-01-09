@@ -160,20 +160,24 @@ class DroneTrack:
     ], dtype=np.float32))
 
     # Process noise (model uncertainty)
+    # Higher vz noise allows faster adaptation to approaching drones
+    # Critical: vz was stuck near 0, causing 79%->66% wrong-sign estimates
+    # Increasing further to 0.05 for even faster vz adaptation
     Q: np.ndarray = field(default_factory=lambda: np.array([
         [0.001, 0, 0, 0, 0, 0],      # x position noise
         [0, 0.001, 0, 0, 0, 0],      # y position noise
         [0, 0, 0.01, 0, 0, 0],       # z position noise (depth less certain)
         [0, 0, 0, 0.005, 0, 0],      # vx noise
         [0, 0, 0, 0, 0.005, 0],      # vy noise
-        [0, 0, 0, 0, 0, 0.001],      # vz noise
+        [0, 0, 0, 0, 0, 0.05],       # vz noise (50x original - sweet spot)
     ], dtype=np.float32))
 
     # Measurement noise (sensor uncertainty)
+    # Reduced z noise to trust depth measurements more (faster vz convergence)
     R: np.ndarray = field(default_factory=lambda: np.array([
         [0.01, 0, 0],     # x measurement variance
         [0, 0.01, 0],     # y measurement variance
-        [0, 0, 0.05],     # z measurement variance (depth estimation)
+        [0, 0, 0.02],     # z measurement variance (reduced from 0.05)
     ], dtype=np.float32))
 
     @property
@@ -273,10 +277,10 @@ class DroneTrack:
 class KalmanTracker:
     """Multi-object tracker using Kalman filters for depth estimation."""
 
-    # Adjusted for edge: smaller reference to get better z resolution for small drones
-    # Original: 0.06 @ z=0.5 means bbox=0.03 gives z=1.0 (clamped)
-    # New: 0.03 @ z=0.5 means bbox=0.03 gives z=0.5, bbox=0.06 gives z=0.25
-    REFERENCE_HEIGHT: float = 0.03
+    # Depth calibration: z = REFERENCE_Z * (REFERENCE_HEIGHT / bbox_height)
+    # Calibrated from simulation data where NanoDet bbox matches ground truth (0.99x)
+    # but z estimates were -0.334 too close. Adjusted from 0.03 to 0.044.
+    REFERENCE_HEIGHT: float = 0.044
     REFERENCE_Z: float = 0.5
 
     def __init__(
@@ -284,10 +288,12 @@ class KalmanTracker:
         max_age: int = 5,
         min_hits: int = 1,  # Reduced from 2 - detections are intermittent
         iou_threshold: float = 0.2,
+        distance_threshold: float = 0.05,  # Fallback: match if centers within 5% of frame
     ):
         self.max_age = max_age
         self.min_hits = min_hits
         self.iou_threshold = iou_threshold
+        self.distance_threshold = distance_threshold
         self.tracks: List[DroneTrack] = []
         self.next_id = 0
         self.frame_count = 0
@@ -339,20 +345,37 @@ class KalmanTracker:
     def _associate_detections(
         self, detections: List[Detection]
     ) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
-        """Associate detections to tracks using Hungarian algorithm."""
+        """Associate detections to tracks using Hungarian algorithm.
+
+        Uses IoU as primary metric, with distance-based fallback for small
+        objects where slight movement can cause zero IoU overlap.
+        """
         if len(self.tracks) == 0:
             return [], [], list(range(len(detections)))
 
         if len(detections) == 0:
             return [], list(range(len(self.tracks))), []
 
+        # Compute both IoU and distance costs
         cost_matrix = np.zeros((len(self.tracks), len(detections)), dtype=np.float32)
+        iou_matrix = np.zeros((len(self.tracks), len(detections)), dtype=np.float32)
+        dist_matrix = np.zeros((len(self.tracks), len(detections)), dtype=np.float32)
 
         for t_idx, track in enumerate(self.tracks):
             for d_idx, det in enumerate(detections):
                 det_box = (det.x, det.y, det.w, det.h)
                 iou = self._compute_iou(track.bbox, det_box)
-                cost_matrix[t_idx, d_idx] = 1 - iou
+                iou_matrix[t_idx, d_idx] = iou
+
+                # Euclidean distance between centers (normalized coords)
+                dist = np.sqrt((track.x - det.x)**2 + (track.y - det.y)**2)
+                dist_matrix[t_idx, d_idx] = dist
+
+                # Use IoU cost, but cap at distance-based cost for small objects
+                # This allows matching when IoU=0 but centers are close
+                iou_cost = 1 - iou
+                dist_cost = dist / self.distance_threshold  # 0 at center, 1 at threshold
+                cost_matrix[t_idx, d_idx] = min(iou_cost, dist_cost)
 
         track_indices, det_indices = hungarian_algorithm(cost_matrix)
 
@@ -361,7 +384,14 @@ class KalmanTracker:
         unmatched_detections = list(range(len(detections)))
 
         for t_idx, d_idx in zip(track_indices, det_indices):
-            if cost_matrix[t_idx, d_idx] <= (1 - self.iou_threshold):
+            iou = iou_matrix[t_idx, d_idx]
+            dist = dist_matrix[t_idx, d_idx]
+
+            # Accept match if IoU passes OR distance is close enough
+            iou_ok = iou >= self.iou_threshold
+            dist_ok = dist <= self.distance_threshold
+
+            if iou_ok or dist_ok:
                 matches.append((t_idx, d_idx))
                 if t_idx in unmatched_tracks:
                     unmatched_tracks.remove(t_idx)
@@ -445,9 +475,16 @@ class KalmanTracker:
 
         return [t for t in self.tracks if t.hits >= self.min_hits]
 
-    def get_tracks_for_observation(self) -> List[DroneTrack]:
-        """Get active tracks sorted by urgency (approaching tracks first)."""
-        confirmed = [t for t in self.tracks if t.hits >= self.min_hits]
+    def get_tracks_for_observation(self, max_misses: int = 3) -> List[DroneTrack]:
+        """Get active tracks sorted by urgency (approaching tracks first).
+
+        Args:
+            max_misses: Exclude tracks that haven't been matched for this many frames.
+                Prevents policy from firing at stale predicted positions.
+        """
+        # Filter: mature tracks that have been matched recently
+        confirmed = [t for t in self.tracks
+                     if t.hits >= self.min_hits and t.misses <= max_misses]
 
         def urgency(track: DroneTrack) -> float:
             if track.vz < 0:

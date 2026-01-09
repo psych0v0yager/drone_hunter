@@ -24,6 +24,7 @@ from core.observation import (
     ObservationNormalizer,
     build_tracker_observation,
     build_oracle_observation,
+    compute_max_urgency,
 )
 from core.adaptive_scheduler import AdaptiveScheduler, calibrate_device
 from core.tiny_detector import TinyDetector
@@ -213,7 +214,8 @@ def run_simulation(
             if scheduler is not None:
                 # Adaptive mode: use scheduler to decide detection tier
                 kalman_uncertainty = tracker.get_max_uncertainty()
-                detection_tier = scheduler.get_detection_tier(frame, kalman_uncertainty)
+                max_urg = compute_max_urgency(tracker)
+                detection_tier = scheduler.get_detection_tier(frame, kalman_uncertainty, max_urg)
             else:
                 # Fixed interval mode
                 run_detection = (step % detect_interval == 0) or oracle_mode or detector is None
@@ -243,6 +245,17 @@ def run_simulation(
                 for track in tracker.get_tracks_for_observation():
                     pred_x, pred_y = track.center
                     track_detections = tiny_detector.detect_at_roi(frame, pred_x, pred_y)
+
+                    # Clamp detection bbox to be within 2x of track's bbox
+                    # This prevents IoU failure from tiny detector's different bbox scale
+                    # (tiny detector outputs bbox sizes up to 3x different from NanoDet)
+                    for det in track_detections:
+                        min_scale, max_scale = 0.7, 1.4  # Tightened to reduce T1 bbox divergence
+                        det.w = float(np.clip(det.w, track.bbox_size[0] * min_scale,
+                                                     track.bbox_size[0] * max_scale))
+                        det.h = float(np.clip(det.h, track.bbox_size[1] * min_scale,
+                                                     track.bbox_size[1] * max_scale))
+
                     detections.extend(track_detections)
             else:
                 # Tier 0: Skip detection entirely

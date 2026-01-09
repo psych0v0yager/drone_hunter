@@ -66,9 +66,54 @@ class ObservationNormalizer:
         return normalized
 
 
+def compute_track_urgency(z: float, vz: float) -> float:
+    """Compute urgency for a single track.
+
+    Urgency measures how soon a drone will impact (low z + diving = high urgency).
+
+    Args:
+        z: Estimated depth (0=impact, 1=far)
+        vz: Estimated vertical velocity (negative = approaching)
+
+    Returns:
+        Urgency value in [0.1, 1.0]
+    """
+    if vz < 0:
+        frames_to_impact = z / max(0.001, abs(vz))
+        return 1.0 / (1.0 + frames_to_impact / 50.0)
+    return 0.1
+
+
+def compute_max_urgency(tracker: KalmanTracker, min_hits: int = 5) -> float:
+    """Compute maximum urgency across all mature tracks.
+
+    Used by adaptive scheduler to force T2 when drones are close/diving.
+
+    Args:
+        tracker: KalmanTracker with active tracks
+        min_hits: Minimum track hits for maturity filter
+
+    Returns:
+        Maximum urgency in [0.0, 1.0], or 0.0 if no mature tracks
+    """
+    tracks = tracker.get_tracks_for_observation()
+    tracks = [t for t in tracks if t.hits >= min_hits]
+
+    if not tracks:
+        return 0.0
+
+    max_urg = 0.0
+    for track in tracks:
+        urg = compute_track_urgency(track.z, track.vz)
+        max_urg = max(max_urg, urg)
+
+    return max_urg
+
+
 def build_tracker_observation(
     tracker: KalmanTracker,
     grid_size: int = 8,
+    min_hits: int = 5,
 ) -> Dict[str, np.ndarray]:
     """Build observation from Kalman tracker (detector mode).
 
@@ -77,11 +122,15 @@ def build_tracker_observation(
     Args:
         tracker: KalmanTracker with active tracks
         grid_size: Size of action grid
+        min_hits: Minimum track hits before including in observation.
+            Prevents snap firing on new/immature tracks.
 
     Returns:
         Dict with "target" and "game_state" arrays
     """
     tracks = tracker.get_tracks_for_observation()
+    # Filter immature tracks - prevent snap firing on new detections
+    tracks = [t for t in tracks if t.hits >= min_hits]
 
     features_per_target = 3 + grid_size * 2  # 19 for grid_size=8
     target_obs = np.zeros(features_per_target, dtype=np.float32)

@@ -32,15 +32,20 @@ from core.observation import (
     ObservationNormalizer,
     build_tracker_observation,
     build_oracle_observation,
+    compute_max_urgency,
 )
+from core.adaptive_scheduler import AdaptiveScheduler
+from core.tiny_detector import TinyDetector
 
 
 def run_live(
     policy_model: Optional[str] = None,
     detector_model: Optional[str] = None,
+    tiny_detector_model: Optional[str] = None,
     normalization_stats: Optional[str] = None,
     backend_type: str = "onnx",
     oracle_mode: bool = False,
+    adaptive_mode: bool = False,
     max_frames: int = 1000,
     grid_size: int = 8,
     display_scale: int = 2,
@@ -67,7 +72,22 @@ def run_live(
     # Initialize components
     game_state = GameState(max_frames=max_frames)
     renderer = Renderer(width=320, height=320)
-    tracker = KalmanTracker()
+    tracker = KalmanTracker(max_age=15)
+
+    # Load tiny detector for adaptive mode
+    tiny_detector = None
+    if tiny_detector_model and adaptive_mode:
+        try:
+            tiny_detector = TinyDetector(tiny_detector_model)
+            print(f"Loaded tiny detector: {tiny_detector_model}")
+        except Exception as e:
+            print(f"Warning: Failed to load tiny detector: {e}")
+
+    # Initialize adaptive scheduler
+    scheduler = None
+    if adaptive_mode:
+        scheduler = AdaptiveScheduler(base_skip=1, tiny_detector=tiny_detector)
+        print("Adaptive mode enabled")
 
     # Load detector if provided
     detector = None
@@ -182,33 +202,62 @@ def run_live(
             frame = renderer.render(game_state)
             t_render = time.perf_counter() - t0
 
-            # Get detections (with optional frame skipping)
+            # Get detections (adaptive or interval-based)
             t0 = time.perf_counter()
-            run_detection = (step % detect_interval == 0) or oracle_mode or detector is None
+            detections = None
+            tier = 2  # Default to full detection
 
-            if run_detection:
-                if oracle_mode or detector is None:
-                    detections = [
-                        Detection(
-                            x=d.x,
-                            y=d.y,
-                            w=d.size,
-                            h=d.size,
-                            confidence=1.0,
-                        )
-                        for d in game_state.drones
-                        if d.is_on_screen()
-                    ]
-                else:
+            if oracle_mode or detector is None:
+                # Oracle mode: use ground truth
+                detections = [
+                    Detection(
+                        x=d.x,
+                        y=d.y,
+                        w=d.size,
+                        h=d.size,
+                        confidence=1.0,
+                    )
+                    for d in game_state.drones
+                    if d.is_on_screen()
+                ]
+            elif adaptive_mode and scheduler:
+                # Adaptive mode: use scheduler to decide tier
+                unc = tracker.get_max_uncertainty()
+                max_urg = compute_max_urgency(tracker)
+                tier = scheduler.get_detection_tier(frame, unc, max_urg)
+
+                if tier == 2:
                     detections = detector.detect(frame)
+                elif tier == 1 and tiny_detector:
+                    detections = []
+                    for trk in tracker.get_tracks_for_observation():
+                        px, py = trk.center
+                        td = tiny_detector.detect_at_roi(frame, px, py)
+                        for d in td:
+                            # Tighter clamping to prevent T1 boxes from being too different from T2
+                            d.w = float(np.clip(d.w, trk.bbox_size[0]*0.7, trk.bbox_size[0]*1.4))
+                            d.h = float(np.clip(d.h, trk.bbox_size[1]*0.7, trk.bbox_size[1]*1.4))
+                        detections.extend(td)
+                else:
+                    detections = None  # Tier 0: skip
             else:
-                # Skip detection, use empty list (tracker will predict)
-                detections = []
+                # Interval-based detection
+                if step % detect_interval == 0:
+                    detections = detector.detect(frame)
+                else:
+                    detections = None
+
             t_detect = time.perf_counter() - t0
 
             # Update tracker
             t0 = time.perf_counter()
-            tracker.update(detections)
+            if detections is None:
+                tracks = tracker.predict_only()
+            else:
+                tracks = tracker.update(detections if detections else [])
+
+            if adaptive_mode and scheduler and tier > 0:
+                scheduler.mark_detection_complete(len(tracks) if tracks else 0)
             t_track = time.perf_counter() - t0
 
             # Build observation
@@ -287,7 +336,12 @@ def run_live(
             screen.blit(pygame_surface, (0, 0))
 
             # Draw additional HUD
-            mode_text = "ORACLE" if oracle_mode else "DETECTOR"
+            if oracle_mode:
+                mode_text = "ORACLE"
+            elif adaptive_mode:
+                mode_text = f"ADAPTIVE T{tier}"
+            else:
+                mode_text = "DETECTOR"
             hud_lines = [
                 f"Episode: {episode}  Frame: {step}/{max_frames}",
                 f"Mode: {mode_text}  Reward: {episode_reward:.1f}",
@@ -361,6 +415,14 @@ def main():
         help="Use oracle mode (ground truth instead of detector)"
     )
     parser.add_argument(
+        "--adaptive", action="store_true",
+        help="Use adaptive compute mode (tiered detection based on uncertainty)"
+    )
+    parser.add_argument(
+        "--tiny-detector", type=str, default=None,
+        help="Path to tiny detector model for Tier 1 detection"
+    )
+    parser.add_argument(
         "--max-frames", type=int, default=1000,
         help="Maximum frames per episode"
     )
@@ -394,9 +456,11 @@ def main():
     run_live(
         policy_model=args.policy,
         detector_model=args.detector,
+        tiny_detector_model=args.tiny_detector,
         normalization_stats=args.normalization,
         backend_type=args.backend,
         oracle_mode=args.oracle,
+        adaptive_mode=args.adaptive,
         max_frames=args.max_frames,
         grid_size=args.grid_size,
         display_scale=args.scale,

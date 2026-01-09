@@ -27,23 +27,24 @@ from core.tiny_detector import TinyDetector
 # These are trace(P[:3,:3]) values from the Kalman filter
 # Post-detection uncertainty: ~2.9, post-skip: ~5-8
 #
-# Tuned thresholds (v4 - for predict_only mode):
-# With predict_only, tracks persist through Tier 0 but uncertainty grows.
-# Use Tier 1 aggressively to keep tracks fresh without expensive Tier 2.
+# Calibrated from actual simulation data (50 episodes):
+#   50th percentile: 1.56
+#   75th percentile: 11.73
+#   95th percentile: 33.31
+#   max: 103.48
 #
 # Decision table (see _decide_tier for full logic):
 # | Uncertainty Range         | No Motion    | Has Motion   |
 # |---------------------------|--------------|--------------|
 # | < VERY_LOW (0.1)          | Tier 0 skip  | Tier 0 skip  |
 # | VERY_LOW - LOW (0.1-1)    | Tier 0 skip  | Tier 1 tiny  |
-# | LOW - MEDIUM (1-100)      | Tier 1 tiny  | Tier 1 tiny  |
-# | MEDIUM - HIGH (100-150)   | Tier 1 tiny  | Tier 2 full  |
-# | > HIGH (150+)             | Tier 1 tiny* | Tier 2 full  |
-# *Tier 1 if < HIGH*2 (300), else Tier 2
+# | LOW - MEDIUM (1-15)       | Tier 1 tiny  | Tier 1 tiny  |
+# | MEDIUM - HIGH (15-40)     | Tier 1 tiny  | Tier 2 full  |
+# | > HIGH (40+)              | Tier 2 full  | Tier 2 full  |
 UNCERTAINTY_VERY_LOW = 0.1
-UNCERTAINTY_LOW = 1.0
-UNCERTAINTY_MEDIUM = 100.0
-UNCERTAINTY_HIGH = 150.0
+UNCERTAINTY_LOW = 0.5      # Reduced: more Tier 1 instead of Tier 0
+UNCERTAINTY_MEDIUM = 8.0   # Reduced: more Tier 1 instead of skip
+UNCERTAINTY_HIGH = 40.0    # ~95th percentile
 
 
 class AdaptiveScheduler:
@@ -139,12 +140,14 @@ class AdaptiveScheduler:
         self,
         frame: np.ndarray,
         kalman_uncertainty: float,
+        max_urgency: float = 0.0,
     ) -> int:
         """Decide which detection tier to use.
 
         Args:
             frame: Current frame (H, W, 3) uint8 RGB.
             kalman_uncertainty: Scalar uncertainty from tracker.get_max_uncertainty().
+            max_urgency: Maximum urgency across tracks (0-1). High urgency = close diving drone.
 
         Returns:
             Detection tier:
@@ -154,6 +157,15 @@ class AdaptiveScheduler:
         """
         self.total_frames += 1
         self.frames_since_detection += 1
+
+        # CRITICAL: Force T2 when urgency is high (close diving drones)
+        # T1's small 40x40 ROI can't capture large close targets
+        if max_urgency > 0.6:
+            self.tier_counts[2] += 1
+            self.tier2_reasons["high_urgency"] = self.tier2_reasons.get("high_urgency", 0) + 1
+            self.frames_since_detection = 0
+            self.last_tier = 2
+            return 2
 
         # Check motion
         has_motion, motion_score = self.motion_detector.detect_motion(frame)
@@ -209,11 +221,11 @@ class AdaptiveScheduler:
             self.tier0_reasons["no_tracks_no_motion"] += 1
             return 0  # No motion, no tracks = nothing happening
 
-        # Rule 1: High uncertainty - prefer Tier 1 if available to refresh tracks
-        # Only use Tier 2 if uncertainty is VERY high or no tiny detector
+        # Rule 1: High uncertainty - use Tier 1 if available to refresh tracks
+        # Only use Tier 2 if no tiny detector
         if uncertainty > self.uncertainty_high:
             has_tiny = self.tiny_detector and self.tiny_detector.enabled
-            if has_tiny and uncertainty < self.uncertainty_high * 2:
+            if has_tiny:
                 # Tier 1 can refresh existing tracks cheaply
                 return 1
             self.tier2_reasons["high_uncertainty"] += 1

@@ -32,7 +32,7 @@ class TinyDetector:
         self,
         model_path: Optional[str] = None,
         roi_size: int = 40,
-        conf_threshold: float = 0.5,
+        conf_threshold: float = 0.82,  # Balanced: not too sensitive, not too strict
     ):
         """Initialize tiny detector.
 
