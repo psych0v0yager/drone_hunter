@@ -32,18 +32,18 @@ from core.tiny_detector import TinyDetector
 # Use Tier 1 aggressively to keep tracks fresh without expensive Tier 2.
 #
 # Decision table (see _decide_tier for full logic):
-# | Uncertainty Range       | No Motion    | Has Motion   |
-# |-------------------------|--------------|--------------|
-# | < VERY_LOW (0.1)        | Tier 0 skip  | Tier 0 skip  |
-# | VERY_LOW - LOW (0.1-2)  | Tier 0 skip  | Tier 1 tiny  |
-# | LOW - MEDIUM (2-25)     | Tier 1 tiny  | Tier 1 tiny  |
-# | MEDIUM - HIGH (25-40)   | Tier 1 tiny  | Tier 2 full  |
-# | > HIGH (40+)            | Tier 1 tiny* | Tier 2 full  |
-# *Tier 1 if < HIGH*2 (80), else Tier 2
+# | Uncertainty Range         | No Motion    | Has Motion   |
+# |---------------------------|--------------|--------------|
+# | < VERY_LOW (0.1)          | Tier 0 skip  | Tier 0 skip  |
+# | VERY_LOW - LOW (0.1-1)    | Tier 0 skip  | Tier 1 tiny  |
+# | LOW - MEDIUM (1-100)      | Tier 1 tiny  | Tier 1 tiny  |
+# | MEDIUM - HIGH (100-150)   | Tier 1 tiny  | Tier 2 full  |
+# | > HIGH (150+)             | Tier 1 tiny* | Tier 2 full  |
+# *Tier 1 if < HIGH*2 (300), else Tier 2
 UNCERTAINTY_VERY_LOW = 0.1
-UNCERTAINTY_LOW = 2.0
-UNCERTAINTY_MEDIUM = 25.0
-UNCERTAINTY_HIGH = 40.0
+UNCERTAINTY_LOW = 1.0
+UNCERTAINTY_MEDIUM = 100.0
+UNCERTAINTY_HIGH = 150.0
 
 
 class AdaptiveScheduler:
@@ -94,6 +94,13 @@ class AdaptiveScheduler:
 
         # Statistics
         self.tier_counts = {0: 0, 1: 0, 2: 0}
+        self.tier0_reasons = {
+            "no_tracks_budget": 0,    # Rule 0: No tracks, under budget
+            "no_tracks_no_motion": 0, # Rule 0: No tracks, no motion
+            "under_budget": 0,        # Rule 3: Under budget
+            "very_low_uncert": 0,     # Rule 4: Very low uncertainty
+            "low_uncert_no_motion": 0,# Rule 5: Low uncertainty, no motion
+        }
         self.tier2_reasons = {
             "no_tracks": 0,      # Rule 0: No active tracks, need to discover
             "high_uncertainty": 0,  # Rule 1: Uncertainty > 8.0
@@ -112,6 +119,13 @@ class AdaptiveScheduler:
     def reset_stats(self) -> None:
         """Reset statistics counters."""
         self.tier_counts = {0: 0, 1: 0, 2: 0}
+        self.tier0_reasons = {
+            "no_tracks_budget": 0,
+            "no_tracks_no_motion": 0,
+            "under_budget": 0,
+            "very_low_uncert": 0,
+            "low_uncert_no_motion": 0,
+        }
         self.tier2_reasons = {
             "no_tracks": 0,
             "high_uncertainty": 0,
@@ -186,11 +200,13 @@ class AdaptiveScheduler:
         if not self.has_active_tracks:
             # Still respect budget to avoid spamming when scene is empty
             if self.frames_since_detection < self.base_skip:
+                self.tier0_reasons["no_tracks_budget"] += 1
                 return 0
             # Check for new drones if motion or been a while
             if has_motion or self.frames_since_detection > self.base_skip * 3:
                 self.tier2_reasons["no_tracks"] += 1
                 return 2
+            self.tier0_reasons["no_tracks_no_motion"] += 1
             return 0  # No motion, no tracks = nothing happening
 
         # Rule 1: High uncertainty - prefer Tier 1 if available to refresh tracks
@@ -214,13 +230,15 @@ class AdaptiveScheduler:
             # This helps on slow devices with high base_skip
             if uncertainty > self.uncertainty_low and has_tiny:
                 return 1
+            self.tier0_reasons["under_budget"] += 1
             return 0
 
         # Rule 4: Very low uncertainty = skip (track is solid)
         if uncertainty < self.uncertainty_very_low:
+            self.tier0_reasons["very_low_uncert"] += 1
             return 0
 
-        # Rule 5: Low uncertainty (2.0-5.0)
+        # Rule 5: Low uncertainty (0.1-1.0)
         if uncertainty < self.uncertainty_low:
             if has_motion:
                 if has_tiny:
@@ -229,6 +247,7 @@ class AdaptiveScheduler:
                     self.tier2_reasons["fallback"] += 1
                     return 2
             else:
+                self.tier0_reasons["low_uncert_no_motion"] += 1
                 return 0  # No motion, skip
 
         # Rule 6: Medium uncertainty (LOW to HIGH)
@@ -273,6 +292,7 @@ class AdaptiveScheduler:
             Dict with tier counts, percentages, and detection rate.
         """
         total = max(1, self.total_frames)
+        tier0_total = max(1, self.tier_counts[0])
         tier2_total = max(1, self.tier_counts[2])
         return {
             "total_frames": self.total_frames,
@@ -282,6 +302,10 @@ class AdaptiveScheduler:
             },
             "detection_rate": (self.tier_counts[1] + self.tier_counts[2]) / total * 100,
             "skip_rate": self.tier_counts[0] / total * 100,
+            "tier0_reasons": self.tier0_reasons.copy(),
+            "tier0_reason_percentages": {
+                k: v / tier0_total * 100 for k, v in self.tier0_reasons.items()
+            },
             "tier2_reasons": self.tier2_reasons.copy(),
             "tier2_reason_percentages": {
                 k: v / tier2_total * 100 for k, v in self.tier2_reasons.items()

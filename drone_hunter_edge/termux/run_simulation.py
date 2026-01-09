@@ -74,7 +74,10 @@ def run_simulation(
     # Initialize components
     game_state = GameState(max_frames=max_frames)
     renderer = Renderer(width=320, height=320)
-    tracker = KalmanTracker()
+    # Adaptive mode needs higher max_age since detection is less frequent
+    # and Tier 1 may miss drones outside its ROI
+    tracker_max_age = 15 if adaptive_mode else 5
+    tracker = KalmanTracker(max_age=tracker_max_age)
 
     # Load detector if provided
     detector = None
@@ -407,8 +410,18 @@ def run_simulation(
             detection_rate = (tier_counts[1] + tier_counts[2]) / total_frames * 100
             print(f"Detection rate: {detection_rate:.1f}%")
 
-            # Tier 2 reason breakdown
+            # Tier 0 and Tier 2 reason breakdowns
             stats = scheduler.get_stats()
+
+            tier0_reasons = stats["tier0_reasons"]
+            tier0_total = tier_counts[0]
+            if tier0_total > 0:
+                print(f"\nTier 0 Breakdown:")
+                for reason, count in tier0_reasons.items():
+                    if count > 0:
+                        pct = count / tier0_total * 100
+                        print(f"  {reason:20s}: {count:5d} ({pct:5.1f}%)")
+
             tier2_reasons = stats["tier2_reasons"]
             tier2_total = tier_counts[2]
             if tier2_total > 0:
