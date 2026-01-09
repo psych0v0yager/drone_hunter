@@ -36,11 +36,13 @@ from core.tiny_detector import TinyDetector
 # |-------------------------|--------------|--------------|
 # | < VERY_LOW (0.1)        | Tier 0 skip  | Tier 0 skip  |
 # | VERY_LOW - LOW (0.1-2)  | Tier 0 skip  | Tier 1 tiny  |
-# | LOW - HIGH (2-40)       | Tier 1 tiny  | Tier 2 full  |
+# | LOW - MEDIUM (2-25)     | Tier 1 tiny  | Tier 1 tiny  |
+# | MEDIUM - HIGH (25-40)   | Tier 1 tiny  | Tier 2 full  |
 # | > HIGH (40+)            | Tier 1 tiny* | Tier 2 full  |
 # *Tier 1 if < HIGH*2 (80), else Tier 2
 UNCERTAINTY_VERY_LOW = 0.1
 UNCERTAINTY_LOW = 2.0
+UNCERTAINTY_MEDIUM = 25.0
 UNCERTAINTY_HIGH = 40.0
 
 
@@ -61,6 +63,7 @@ class AdaptiveScheduler:
         motion_threshold: float = 5.0,
         uncertainty_very_low: float = UNCERTAINTY_VERY_LOW,
         uncertainty_low: float = UNCERTAINTY_LOW,
+        uncertainty_medium: float = UNCERTAINTY_MEDIUM,
         uncertainty_high: float = UNCERTAINTY_HIGH,
     ):
         """Initialize adaptive scheduler.
@@ -72,6 +75,7 @@ class AdaptiveScheduler:
             motion_threshold: Threshold for motion detection (default 5.0).
             uncertainty_very_low: Below this, skip even with motion.
             uncertainty_low: Below this, use tiny detector (if motion) or skip.
+            uncertainty_medium: Below this with motion, use Tier 1 instead of Tier 2.
             uncertainty_high: Above this, always use Tier 2 (full detection).
         """
         self.base_skip = base_skip
@@ -80,6 +84,7 @@ class AdaptiveScheduler:
 
         self.uncertainty_very_low = uncertainty_very_low
         self.uncertainty_low = uncertainty_low
+        self.uncertainty_medium = uncertainty_medium
         self.uncertainty_high = uncertainty_high
 
         # State
@@ -226,10 +231,21 @@ class AdaptiveScheduler:
             else:
                 return 0  # No motion, skip
 
-        # Rule 6: Medium uncertainty (5.0-8.0)
+        # Rule 6: Medium uncertainty (LOW to HIGH)
+        # Split: below MEDIUM (25) use Tier 1 even with motion
+        #        above MEDIUM use Tier 2 with motion
         if has_motion:
-            self.tier2_reasons["motion_medium"] += 1
-            return 2  # Motion + medium uncertainty = full detect
+            if uncertainty < self.uncertainty_medium:
+                # Lower-medium: Tier 1 is sufficient
+                if has_tiny:
+                    return 1
+                else:
+                    self.tier2_reasons["fallback"] += 1
+                    return 2
+            else:
+                # Upper-medium: need full detection
+                self.tier2_reasons["motion_medium"] += 1
+                return 2
         else:
             if has_tiny:
                 return 1
