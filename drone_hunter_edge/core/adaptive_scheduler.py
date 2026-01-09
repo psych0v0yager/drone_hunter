@@ -23,11 +23,12 @@ from core.motion import MotionDetector
 from core.tiny_detector import TinyDetector
 
 
-# Uncertainty thresholds (tuned empirically via benchmark_uncertainty.py)
+# Uncertainty thresholds (tuned via ablation_thresholds.py)
 # These are trace(P[:3,:3]) values from the Kalman filter
-# Mean uncertainty ~1.7, so thresholds set around that
-UNCERTAINTY_LOW = 2.0    # Below this: coast on prediction
-UNCERTAINTY_HIGH = 5.0   # Above this: must run full detection
+# Post-detection uncertainty: ~2.9, post-skip: ~5-8
+# LOW > 2.9 prevents immediate re-detection after detecting
+UNCERTAINTY_LOW = 3.0
+UNCERTAINTY_HIGH = 7.0
 
 
 class AdaptiveScheduler:
