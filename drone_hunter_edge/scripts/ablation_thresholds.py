@@ -46,8 +46,8 @@ def run_episode(low_thresh, high_thresh, max_frames=500, base_skip=3):
                 Detection(x=d.x, y=d.y, w=d.size, h=d.size, confidence=1.0)
                 for d in game_state.drones if d.is_on_screen()
             ]
-            tracker.update(detections)
-            scheduler.mark_detection_complete()
+            confirmed_tracks = tracker.update(detections)
+            scheduler.mark_detection_complete(len(confirmed_tracks))
         else:
             tracker.update([])  # Predict only
         

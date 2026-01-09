@@ -26,6 +26,7 @@ from core.observation import (
     build_oracle_observation,
 )
 from core.adaptive_scheduler import AdaptiveScheduler, calibrate_device
+from core.tiny_detector import TinyDetector
 
 
 def run_simulation(
@@ -45,6 +46,7 @@ def run_simulation(
     provider_priority: str = "auto",
     adaptive_mode: bool = False,
     adaptive_base_skip: Optional[int] = None,
+    tiny_detector_path: Optional[str] = None,
 ) -> dict:
     """Run the drone hunter simulation.
 
@@ -125,19 +127,31 @@ def run_simulation(
 
     # Initialize adaptive scheduler if enabled
     scheduler = None
+    tiny_detector = None
     if adaptive_mode and not oracle_mode:
+        # Load tiny detector if provided
+        if tiny_detector_path:
+            tiny_detector = TinyDetector(tiny_detector_path)
+            if tiny_detector.enabled:
+                if verbose:
+                    print(f"Loaded tiny detector: {tiny_detector_path}")
+            else:
+                tiny_detector = None
+                if verbose:
+                    print(f"Warning: Failed to load tiny detector: {tiny_detector_path}")
+
         if adaptive_base_skip is not None:
-            scheduler = AdaptiveScheduler(base_skip=adaptive_base_skip)
+            scheduler = AdaptiveScheduler(base_skip=adaptive_base_skip, tiny_detector=tiny_detector)
             if verbose:
                 print(f"Adaptive mode enabled (base_skip={adaptive_base_skip})")
         elif detector is not None:
             # Auto-calibrate based on device speed
             base_skip, latency_ms = calibrate_device(detector)
-            scheduler = AdaptiveScheduler(base_skip=base_skip)
+            scheduler = AdaptiveScheduler(base_skip=base_skip, tiny_detector=tiny_detector)
             if verbose:
                 print(f"Adaptive mode enabled (auto-calibrated: {latency_ms:.1f}ms -> base_skip={base_skip})")
         else:
-            scheduler = AdaptiveScheduler(base_skip=3)
+            scheduler = AdaptiveScheduler(base_skip=3, tiny_detector=tiny_detector)
             if verbose:
                 print("Adaptive mode enabled (default base_skip=3)")
 
@@ -227,8 +241,12 @@ def run_simulation(
 
             # Update tracker
             t0 = time.time()
-            tracker.update(detections)
+            confirmed_tracks = tracker.update(detections)
             t_track = time.time() - t0
+
+            # Update scheduler with track count (for has_active_tracks state)
+            if scheduler is not None and run_detection:
+                scheduler.mark_detection_complete(len(confirmed_tracks))
 
             # Build observation
             if oracle_mode:
@@ -375,6 +393,17 @@ def run_simulation(
             detection_rate = (tier_counts[1] + tier_counts[2]) / total_frames * 100
             print(f"Detection rate: {detection_rate:.1f}%")
 
+            # Tier 2 reason breakdown
+            stats = scheduler.get_stats()
+            tier2_reasons = stats["tier2_reasons"]
+            tier2_total = tier_counts[2]
+            if tier2_total > 0:
+                print(f"\nTier 2 Breakdown:")
+                for reason, count in tier2_reasons.items():
+                    if count > 0:
+                        pct = count / tier2_total * 100
+                        print(f"  {reason:20s}: {count:5d} ({pct:5.1f}%)")
+
             uncertainties = all_stats["adaptive"]["uncertainties"]
             print(f"\nUncertainty: mean={np.mean(uncertainties):.3f} "
                   f"std={np.std(uncertainties):.3f} "
@@ -455,6 +484,10 @@ def main():
         "--adaptive-base-skip", type=int, default=None,
         help="Override base_skip for adaptive mode (default: auto-calibrate based on device speed)"
     )
+    parser.add_argument(
+        "--tiny-detector", type=str, default=None,
+        help="Path to tiny detector ONNX model for Tier 1 detection in adaptive mode"
+    )
 
     args = parser.parse_args()
 
@@ -477,6 +510,7 @@ def main():
         provider_priority=args.provider,
         adaptive_mode=args.adaptive,
         adaptive_base_skip=args.adaptive_base_skip,
+        tiny_detector_path=args.tiny_detector,
     )
 
     elapsed = time.time() - start_time

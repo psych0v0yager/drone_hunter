@@ -165,8 +165,13 @@ class TinyDetector:
     ) -> List[Detection]:
         """Postprocess model outputs to detections in full-frame coords.
 
+        Model output format: [cx, cy, w, h, conf] (5 values)
+        - cx, cy: drone center within ROI (0-1 normalized to ROI)
+        - w, h: drone size relative to ROI (can be > 1 for clipped drones)
+        - conf: confidence score (0-1)
+
         Args:
-            outputs: Raw model output.
+            outputs: Raw model output of shape (1, 5).
             x_offset: ROI x offset in pixels.
             y_offset: ROI y offset in pixels.
             frame_width: Full frame width.
@@ -175,10 +180,26 @@ class TinyDetector:
         Returns:
             List of Detection objects with full-frame normalized coords.
         """
-        # TODO: Implement actual postprocessing when model is provided
-        # This will depend on the tiny model's output format
-        # For now, return empty list (scaffolding)
-        return []
+        # outputs shape: (1, 5) -> [cx, cy, w, h, conf]
+        cx, cy, w, h, conf = outputs[0]
+
+        if conf < self.conf_threshold:
+            return []
+
+        # Convert ROI-local coords to full-frame normalized coords
+        # cx, cy are 0-1 within ROI
+        full_x = (x_offset + cx * self.roi_size) / frame_width
+        full_y = (y_offset + cy * self.roi_size) / frame_height
+        full_w = (w * self.roi_size) / frame_width
+        full_h = (h * self.roi_size) / frame_height
+
+        return [Detection(
+            x=float(full_x),
+            y=float(full_y),
+            w=float(full_w),
+            h=float(full_h),
+            confidence=float(conf),
+        )]
 
     def detect_at_roi(
         self,

@@ -26,9 +26,15 @@ from core.tiny_detector import TinyDetector
 # Uncertainty thresholds (tuned via ablation_thresholds.py)
 # These are trace(P[:3,:3]) values from the Kalman filter
 # Post-detection uncertainty: ~2.9, post-skip: ~5-8
-# LOW > 2.9 prevents immediate re-detection after detecting
-UNCERTAINTY_LOW = 3.0
-UNCERTAINTY_HIGH = 7.0
+#
+# New tiered thresholds (v2):
+# - VERY_LOW (<2.0): Safe to skip even with motion
+# - LOW (2.0-5.0): Use tiny detector if motion, else skip
+# - MEDIUM (5.0-8.0): Use tiny detector without motion, full with motion
+# - HIGH (>8.0): Always full detection
+UNCERTAINTY_VERY_LOW = 2.0
+UNCERTAINTY_LOW = 5.0
+UNCERTAINTY_HIGH = 8.0
 
 
 class AdaptiveScheduler:
@@ -46,6 +52,7 @@ class AdaptiveScheduler:
         base_skip: int = 3,
         tiny_detector: Optional[TinyDetector] = None,
         motion_threshold: float = 5.0,
+        uncertainty_very_low: float = UNCERTAINTY_VERY_LOW,
         uncertainty_low: float = UNCERTAINTY_LOW,
         uncertainty_high: float = UNCERTAINTY_HIGH,
     ):
@@ -56,22 +63,32 @@ class AdaptiveScheduler:
                 Set via calibrate_device() or manually based on device speed.
             tiny_detector: Optional TinyDetector for Tier 1 detection.
             motion_threshold: Threshold for motion detection (default 5.0).
-            uncertainty_low: Below this, prefer Tier 1 or skip.
+            uncertainty_very_low: Below this, skip even with motion.
+            uncertainty_low: Below this, use tiny detector (if motion) or skip.
             uncertainty_high: Above this, always use Tier 2 (full detection).
         """
         self.base_skip = base_skip
         self.tiny_detector = tiny_detector
         self.motion_detector = MotionDetector(threshold=motion_threshold)
 
+        self.uncertainty_very_low = uncertainty_very_low
         self.uncertainty_low = uncertainty_low
         self.uncertainty_high = uncertainty_high
 
         # State
         self.frames_since_detection = 0
         self.last_tier = 0
+        self.has_active_tracks = False  # Must do full detect to discover drones
 
         # Statistics
         self.tier_counts = {0: 0, 1: 0, 2: 0}
+        self.tier2_reasons = {
+            "no_tracks": 0,      # Rule 0: No active tracks, need to discover
+            "high_uncertainty": 0,  # Rule 1: Uncertainty > 8.0
+            "staleness": 0,      # Rule 2: Too long since last detection
+            "motion_medium": 0,  # Rule 6: Medium uncertainty + motion
+            "fallback": 0,       # Tiny detector unavailable fallback
+        }
         self.total_frames = 0
 
     def reset(self) -> None:
@@ -83,6 +100,13 @@ class AdaptiveScheduler:
     def reset_stats(self) -> None:
         """Reset statistics counters."""
         self.tier_counts = {0: 0, 1: 0, 2: 0}
+        self.tier2_reasons = {
+            "no_tracks": 0,
+            "high_uncertainty": 0,
+            "staleness": 0,
+            "motion_medium": 0,
+            "fallback": 0,
+        }
         self.total_frames = 0
 
     def get_detection_tier(
@@ -123,6 +147,17 @@ class AdaptiveScheduler:
     def _decide_tier(self, has_motion: bool, uncertainty: float) -> int:
         """Core tier decision logic.
 
+        New tiered logic (v2):
+        | Uncertainty     | No Motion      | Has Motion     |
+        |-----------------|----------------|----------------|
+        | < 2.0 (v.low)   | Tier 0 (skip)  | Tier 0 (skip)  |
+        | 2.0-5.0 (low)   | Tier 0 (skip)  | Tier 1 (tiny)  |
+        | 5.0-8.0 (med)   | Tier 1 (tiny)  | Tier 2 (full)  |
+        | > 8.0 (high)    | Tier 2 (full)  | Tier 2 (full)  |
+
+        Special case: No active tracks → must use Tier 2 to discover drones
+        (Tier 1 needs predicted ROI location from existing tracks)
+
         Args:
             has_motion: True if motion detected in frame.
             uncertainty: Kalman uncertainty value.
@@ -130,33 +165,68 @@ class AdaptiveScheduler:
         Returns:
             Detection tier (0, 1, or 2).
         """
+        has_tiny = self.tiny_detector and self.tiny_detector.enabled
+
+        # Rule 0: No tracks = need full detection to discover drones
+        # (Tier 1 can only confirm existing tracks, not find new ones)
+        if not self.has_active_tracks:
+            # Still respect budget to avoid spamming when scene is empty
+            if self.frames_since_detection < self.base_skip:
+                return 0
+            # Check for new drones if motion or been a while
+            if has_motion or self.frames_since_detection > self.base_skip * 3:
+                self.tier2_reasons["no_tracks"] += 1
+                return 2
+            return 0  # No motion, no tracks = nothing happening
+
         # Rule 1: High uncertainty = MUST detect (never skip threats)
         if uncertainty > self.uncertainty_high:
+            self.tier2_reasons["high_uncertainty"] += 1
             return 2
 
-        # Rule 2: Staleness check - must detect if too long since last
-        if self.frames_since_detection > self.base_skip * 3:
+        # Rule 2: Staleness check - periodic full detect to catch new drones
+        if self.frames_since_detection > self.base_skip * 5:
+            self.tier2_reasons["staleness"] += 1
             return 2
 
         # Rule 3: Under budget = skip
         if self.frames_since_detection < self.base_skip:
             return 0
 
-        # Rule 4: No motion + low uncertainty = safe to skip
-        if not has_motion and uncertainty < self.uncertainty_low:
+        # Rule 4: Very low uncertainty = skip (track is solid)
+        if uncertainty < self.uncertainty_very_low:
             return 0
 
-        # Rule 5: Low uncertainty + motion = tiny detector (if available)
+        # Rule 5: Low uncertainty (2.0-5.0)
         if uncertainty < self.uncertainty_low:
-            if self.tiny_detector and self.tiny_detector.enabled:
+            if has_motion:
+                if has_tiny:
+                    return 1
+                else:
+                    self.tier2_reasons["fallback"] += 1
+                    return 2
+            else:
+                return 0  # No motion, skip
+
+        # Rule 6: Medium uncertainty (5.0-8.0)
+        if has_motion:
+            self.tier2_reasons["motion_medium"] += 1
+            return 2  # Motion + medium uncertainty = full detect
+        else:
+            if has_tiny:
                 return 1
+            else:
+                self.tier2_reasons["fallback"] += 1
+                return 2
 
-        # Default: full detection
-        return 2
+    def mark_detection_complete(self, num_tracks: int = 0) -> None:
+        """Call after detection to reset counter and update track state.
 
-    def mark_detection_complete(self) -> None:
-        """Call after successful detection to reset counter."""
+        Args:
+            num_tracks: Number of active tracks after this detection.
+        """
         self.frames_since_detection = 0
+        self.has_active_tracks = num_tracks > 0
 
     def get_stats(self) -> dict:
         """Get scheduling statistics.
@@ -165,6 +235,7 @@ class AdaptiveScheduler:
             Dict with tier counts, percentages, and detection rate.
         """
         total = max(1, self.total_frames)
+        tier2_total = max(1, self.tier_counts[2])
         return {
             "total_frames": self.total_frames,
             "tier_counts": self.tier_counts.copy(),
@@ -173,6 +244,10 @@ class AdaptiveScheduler:
             },
             "detection_rate": (self.tier_counts[1] + self.tier_counts[2]) / total * 100,
             "skip_rate": self.tier_counts[0] / total * 100,
+            "tier2_reasons": self.tier2_reasons.copy(),
+            "tier2_reason_percentages": {
+                k: v / tier2_total * 100 for k, v in self.tier2_reasons.items()
+            },
         }
 
 
