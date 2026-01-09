@@ -211,13 +211,13 @@ def run_simulation(
                 # Adaptive mode: use scheduler to decide detection tier
                 kalman_uncertainty = tracker.get_max_uncertainty()
                 detection_tier = scheduler.get_detection_tier(frame, kalman_uncertainty)
-                run_detection = detection_tier >= 2  # Tier 2 = full detection
             else:
                 # Fixed interval mode
                 run_detection = (step % detect_interval == 0) or oracle_mode or detector is None
                 detection_tier = 2 if run_detection else 0
 
-            if run_detection:
+            if detection_tier == 2:
+                # Tier 2: Full detection
                 if oracle_mode or detector is None:
                     # Oracle mode: use ground truth
                     detections = [
@@ -234,8 +234,15 @@ def run_simulation(
                 else:
                     # Detector mode: run NanoDet
                     detections = detector.detect(frame)
+            elif detection_tier == 1 and tiny_detector is not None:
+                # Tier 1: Run tiny detector at each predicted track location
+                detections = []
+                for track in tracker.get_tracks_for_observation():
+                    pred_x, pred_y = track.center
+                    track_detections = tiny_detector.detect_at_roi(frame, pred_x, pred_y)
+                    detections.extend(track_detections)
             else:
-                # Skip detection, tracker will predict
+                # Tier 0: Skip detection, tracker will predict
                 detections = []
             t_detect = time.time() - t0
 
@@ -245,7 +252,7 @@ def run_simulation(
             t_track = time.time() - t0
 
             # Update scheduler with track count (for has_active_tracks state)
-            if scheduler is not None and run_detection:
+            if scheduler is not None and detection_tier > 0:
                 scheduler.mark_detection_complete(len(confirmed_tracks))
 
             # Build observation

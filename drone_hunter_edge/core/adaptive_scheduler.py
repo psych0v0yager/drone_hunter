@@ -27,14 +27,15 @@ from core.tiny_detector import TinyDetector
 # These are trace(P[:3,:3]) values from the Kalman filter
 # Post-detection uncertainty: ~2.9, post-skip: ~5-8
 #
-# New tiered thresholds (v2):
-# - VERY_LOW (<2.0): Safe to skip even with motion
-# - LOW (2.0-5.0): Use tiny detector if motion, else skip
-# - MEDIUM (5.0-8.0): Use tiny detector without motion, full with motion
-# - HIGH (>8.0): Always full detection
-UNCERTAINTY_VERY_LOW = 2.0
-UNCERTAINTY_LOW = 5.0
-UNCERTAINTY_HIGH = 8.0
+# Tuned thresholds (v3 - 50-episode ablation):
+# - VERY_LOW (<1.5): Safe to skip even with motion
+# - LOW (1.5-4.0): Use tiny detector if motion, else skip
+# - MEDIUM (4.0-10.0): Use tiny detector without motion, full with motion
+# - HIGH (>10.0): Always full detection
+# Best config: 50% survival, 66.8 reward, 94.4% hit rate, 463 FPS
+UNCERTAINTY_VERY_LOW = 1.5
+UNCERTAINTY_LOW = 4.0
+UNCERTAINTY_HIGH = 10.0
 
 
 class AdaptiveScheduler:
