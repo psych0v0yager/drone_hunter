@@ -128,22 +128,21 @@ class AdaptiveScheduler:
         Returns:
             Detection tier (0, 1, or 2).
         """
-        # Rule 1: No motion + recent detection = skip
-        # (but don't skip too long - staleness check)
-        if not has_motion and self.frames_since_detection < self.base_skip * 2:
-            return 0
-
-        # Rule 2: High uncertainty = must detect (full)
+        # Rule 1: High uncertainty = MUST detect (never skip threats)
         if uncertainty > self.uncertainty_high:
+            return 2
+
+        # Rule 2: Staleness check - must detect if too long since last
+        if self.frames_since_detection > self.base_skip * 3:
             return 2
 
         # Rule 3: Under budget = skip
         if self.frames_since_detection < self.base_skip:
             return 0
 
-        # Rule 4: Staleness check - must detect if too long since last
-        if self.frames_since_detection > self.base_skip * 3:
-            return 2
+        # Rule 4: No motion + low uncertainty = safe to skip
+        if not has_motion and uncertainty < self.uncertainty_low:
+            return 0
 
         # Rule 5: Low uncertainty + motion = tiny detector (if available)
         if uncertainty < self.uncertainty_low:

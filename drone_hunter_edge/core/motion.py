@@ -41,12 +41,12 @@ class MotionDetector:
     Used as a gate to skip detection when nothing is moving.
     """
 
-    def __init__(self, threshold: float = 5.0):
+    def __init__(self, threshold: float = 0.3):
         """Initialize motion detector.
 
         Args:
             threshold: Mean pixel difference threshold for motion detection.
-                Default 5.0 works well for typical drone scenes.
+                Default 0.3 tuned for drone sprites (~0.4 diff when moving).
                 Lower = more sensitive, higher = less sensitive.
         """
         self.prev_frame = None
