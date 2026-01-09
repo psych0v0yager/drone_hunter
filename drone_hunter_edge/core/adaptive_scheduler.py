@@ -30,12 +30,18 @@ from core.tiny_detector import TinyDetector
 # Tuned thresholds (v4 - for predict_only mode):
 # With predict_only, tracks persist through Tier 0 but uncertainty grows.
 # Use Tier 1 aggressively to keep tracks fresh without expensive Tier 2.
-# - VERY_LOW (<0.5): Only skip if extremely confident
-# - LOW (0.5-3.0): Use tiny detector to refresh tracks
-# - HIGH (>15.0): Full detection only when tracks are very stale
-UNCERTAINTY_VERY_LOW = 0.5
-UNCERTAINTY_LOW = 3.0
-UNCERTAINTY_HIGH = 15.0
+#
+# Decision table (see _decide_tier for full logic):
+# | Uncertainty Range       | No Motion    | Has Motion   |
+# |-------------------------|--------------|--------------|
+# | < VERY_LOW (0.1)        | Tier 0 skip  | Tier 0 skip  |
+# | VERY_LOW - LOW (0.1-2)  | Tier 0 skip  | Tier 1 tiny  |
+# | LOW - HIGH (2-40)       | Tier 1 tiny  | Tier 2 full  |
+# | > HIGH (40+)            | Tier 1 tiny* | Tier 2 full  |
+# *Tier 1 if < HIGH*2 (80), else Tier 2
+UNCERTAINTY_VERY_LOW = 0.1
+UNCERTAINTY_LOW = 2.0
+UNCERTAINTY_HIGH = 40.0
 
 
 class AdaptiveScheduler:
@@ -197,8 +203,12 @@ class AdaptiveScheduler:
             self.tier2_reasons["staleness"] += 1
             return 2
 
-        # Rule 3: Under budget = skip
+        # Rule 3: Under budget - skip unless uncertainty warrants Tier 1
         if self.frames_since_detection < self.base_skip:
+            # Allow Tier 1 even under budget if uncertainty is medium+
+            # This helps on slow devices with high base_skip
+            if uncertainty > self.uncertainty_low and has_tiny:
+                return 1
             return 0
 
         # Rule 4: Very low uncertainty = skip (track is solid)
