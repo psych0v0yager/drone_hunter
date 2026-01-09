@@ -1,19 +1,15 @@
-"""Kalman filter-based multi-object tracker for drone depth estimation.
-
-Pure Python implementation without scipy dependency for edge deployment.
-"""
+"""Kalman filter-based multi-object tracker for drone depth estimation."""
 
 from dataclasses import dataclass, field
 from typing import List, Tuple
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from core.detection import Detection
 
 
 def hungarian_algorithm(cost_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Pure Python Hungarian algorithm for optimal assignment.
-
-    Simple O(n^3) implementation suitable for small matrices (<20x20).
+    """Optimal assignment using scipy's linear_sum_assignment.
 
     Args:
         cost_matrix: NxM cost matrix (rows=tracks, cols=detections)
@@ -21,89 +17,109 @@ def hungarian_algorithm(cost_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray
     Returns:
         Tuple of (row_indices, col_indices) for optimal assignment
     """
-    n_rows, n_cols = cost_matrix.shape
-
-    if n_rows == 0 or n_cols == 0:
+    if cost_matrix.size == 0:
         return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
 
-    # Pad to square matrix
-    n = max(n_rows, n_cols)
-    padded = np.full((n, n), cost_matrix.max() + 1, dtype=np.float32)
-    padded[:n_rows, :n_cols] = cost_matrix
+    row_indices, col_indices = linear_sum_assignment(cost_matrix)
+    return row_indices.astype(np.int32), col_indices.astype(np.int32)
 
-    # Step 1: Subtract row minimum
-    padded -= padded.min(axis=1, keepdims=True)
 
-    # Step 2: Subtract column minimum
-    padded -= padded.min(axis=0, keepdims=True)
-
-    # Iterative assignment
-    max_iter = n * 2
-    for _ in range(max_iter):
-        # Find zeros and try to assign
-        row_assigned = np.full(n, -1, dtype=np.int32)
-        col_assigned = np.full(n, -1, dtype=np.int32)
-
-        for i in range(n):
-            for j in range(n):
-                if padded[i, j] == 0 and row_assigned[i] == -1 and col_assigned[j] == -1:
-                    row_assigned[i] = j
-                    col_assigned[j] = i
-
-        # Count assignments
-        n_assigned = np.sum(row_assigned >= 0)
-        if n_assigned == n:
-            break
-
-        # Mark rows without assignment
-        row_covered = row_assigned >= 0
-        col_covered = np.zeros(n, dtype=bool)
-
-        # Cover columns with zeros in uncovered rows
-        changed = True
-        while changed:
-            changed = False
-            for i in range(n):
-                if not row_covered[i]:
-                    for j in range(n):
-                        if padded[i, j] == 0 and not col_covered[j]:
-                            col_covered[j] = True
-                            changed = True
-
-            for j in range(n):
-                if col_covered[j]:
-                    for i in range(n):
-                        if row_assigned[i] == j and row_covered[i]:
-                            row_covered[i] = False
-                            changed = True
-
-        # Find minimum uncovered value
-        min_val = float('inf')
-        for i in range(n):
-            for j in range(n):
-                if not row_covered[i] and not col_covered[j]:
-                    min_val = min(min_val, padded[i, j])
-
-        if min_val == float('inf'):
-            break
-
-        # Subtract from uncovered, add to doubly covered
-        for i in range(n):
-            for j in range(n):
-                if not row_covered[i] and not col_covered[j]:
-                    padded[i, j] -= min_val
-                elif row_covered[i] and col_covered[j]:
-                    padded[i, j] += min_val
-
-    # Extract valid assignments (within original matrix bounds)
-    rows = []
-    cols = []
-    for i in range(n_rows):
-        if row_assigned[i] >= 0 and row_assigned[i] < n_cols:
-            rows.append(i)
-            cols.append(row_assigned[i])
-
-    return np.array(rows, dtype=np.int32), np.array(cols, dtype=np.int32)
+# Legacy pure Python implementation (commented out - had bugs and was slow)
+# def hungarian_algorithm_python(cost_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+#     """Pure Python Hungarian algorithm for optimal assignment.
+#
+#     Simple O(n^3) implementation suitable for small matrices (<20x20).
+#     NOTE: This implementation has bugs - doesn't always find complete assignment.
+#
+#     Args:
+#         cost_matrix: NxM cost matrix (rows=tracks, cols=detections)
+#
+#     Returns:
+#         Tuple of (row_indices, col_indices) for optimal assignment
+#     """
+#     n_rows, n_cols = cost_matrix.shape
+#
+#     if n_rows == 0 or n_cols == 0:
+#         return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+#
+#     # Pad to square matrix
+#     n = max(n_rows, n_cols)
+#     padded = np.full((n, n), cost_matrix.max() + 1, dtype=np.float32)
+#     padded[:n_rows, :n_cols] = cost_matrix
+#
+#     # Step 1: Subtract row minimum
+#     padded -= padded.min(axis=1, keepdims=True)
+#
+#     # Step 2: Subtract column minimum
+#     padded -= padded.min(axis=0, keepdims=True)
+#
+#     # Iterative assignment
+#     max_iter = n * 2
+#     for _ in range(max_iter):
+#         # Find zeros and try to assign
+#         row_assigned = np.full(n, -1, dtype=np.int32)
+#         col_assigned = np.full(n, -1, dtype=np.int32)
+#
+#         for i in range(n):
+#             for j in range(n):
+#                 if padded[i, j] == 0 and row_assigned[i] == -1 and col_assigned[j] == -1:
+#                     row_assigned[i] = j
+#                     col_assigned[j] = i
+#
+#         # Count assignments
+#         n_assigned = np.sum(row_assigned >= 0)
+#         if n_assigned == n:
+#             break
+#
+#         # Mark rows without assignment
+#         row_covered = row_assigned >= 0
+#         col_covered = np.zeros(n, dtype=bool)
+#
+#         # Cover columns with zeros in uncovered rows
+#         changed = True
+#         while changed:
+#             changed = False
+#             for i in range(n):
+#                 if not row_covered[i]:
+#                     for j in range(n):
+#                         if padded[i, j] == 0 and not col_covered[j]:
+#                             col_covered[j] = True
+#                             changed = True
+#
+#             for j in range(n):
+#                 if col_covered[j]:
+#                     for i in range(n):
+#                         if row_assigned[i] == j and row_covered[i]:
+#                             row_covered[i] = False
+#                             changed = True
+#
+#         # Find minimum uncovered value
+#         min_val = float('inf')
+#         for i in range(n):
+#             for j in range(n):
+#                 if not row_covered[i] and not col_covered[j]:
+#                     min_val = min(min_val, padded[i, j])
+#
+#         if min_val == float('inf'):
+#             break
+#
+#         # Subtract from uncovered, add to doubly covered
+#         for i in range(n):
+#             for j in range(n):
+#                 if not row_covered[i] and not col_covered[j]:
+#                     padded[i, j] -= min_val
+#                 elif row_covered[i] and col_covered[j]:
+#                     padded[i, j] += min_val
+#
+#     # Extract valid assignments (within original matrix bounds)
+#     rows = []
+#     cols = []
+#     for i in range(n_rows):
+#         if row_assigned[i] >= 0 and row_assigned[i] < n_cols:
+#             rows.append(i)
+#             cols.append(row_assigned[i])
+#
+#     return np.array(rows, dtype=np.int32), np.array(cols, dtype=np.int32)
 
 
 @dataclass
