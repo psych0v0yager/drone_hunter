@@ -27,15 +27,15 @@ from core.tiny_detector import TinyDetector
 # These are trace(P[:3,:3]) values from the Kalman filter
 # Post-detection uncertainty: ~2.9, post-skip: ~5-8
 #
-# Tuned thresholds (v3 - 50-episode ablation):
-# - VERY_LOW (<1.5): Safe to skip even with motion
-# - LOW (1.5-4.0): Use tiny detector if motion, else skip
-# - MEDIUM (4.0-10.0): Use tiny detector without motion, full with motion
-# - HIGH (>10.0): Always full detection
-# Best config: 50% survival, 66.8 reward, 94.4% hit rate, 463 FPS
-UNCERTAINTY_VERY_LOW = 1.5
-UNCERTAINTY_LOW = 4.0
-UNCERTAINTY_HIGH = 10.0
+# Tuned thresholds (v4 - for predict_only mode):
+# With predict_only, tracks persist through Tier 0 but uncertainty grows.
+# Use Tier 1 aggressively to keep tracks fresh without expensive Tier 2.
+# - VERY_LOW (<0.5): Only skip if extremely confident
+# - LOW (0.5-3.0): Use tiny detector to refresh tracks
+# - HIGH (>15.0): Full detection only when tracks are very stale
+UNCERTAINTY_VERY_LOW = 0.5
+UNCERTAINTY_LOW = 3.0
+UNCERTAINTY_HIGH = 15.0
 
 
 class AdaptiveScheduler:
@@ -136,8 +136,10 @@ class AdaptiveScheduler:
         # Decision logic
         tier = self._decide_tier(has_motion, kalman_uncertainty)
 
-        # Update state if we're detecting
-        if tier > 0:
+        # Update state if we're doing full detection
+        # Only Tier 2 can discover NEW drones, so only Tier 2 resets staleness counter
+        # Tier 1 only looks at existing track ROIs, can't find new threats
+        if tier == 2:
             self.frames_since_detection = 0
 
         self.last_tier = tier
@@ -180,8 +182,13 @@ class AdaptiveScheduler:
                 return 2
             return 0  # No motion, no tracks = nothing happening
 
-        # Rule 1: High uncertainty = MUST detect (never skip threats)
+        # Rule 1: High uncertainty - prefer Tier 1 if available to refresh tracks
+        # Only use Tier 2 if uncertainty is VERY high or no tiny detector
         if uncertainty > self.uncertainty_high:
+            has_tiny = self.tiny_detector and self.tiny_detector.enabled
+            if has_tiny and uncertainty < self.uncertainty_high * 2:
+                # Tier 1 can refresh existing tracks cheaply
+                return 1
             self.tier2_reasons["high_uncertainty"] += 1
             return 2
 
@@ -221,12 +228,16 @@ class AdaptiveScheduler:
                 return 2
 
     def mark_detection_complete(self, num_tracks: int = 0) -> None:
-        """Call after detection to reset counter and update track state.
+        """Update track state after detection.
+
+        NOTE: Does NOT reset frames_since_detection - that's now handled
+        internally in get_detection_tier() to only reset for Tier 2
+        (full detection that can discover new drones).
 
         Args:
             num_tracks: Number of active tracks after this detection.
         """
-        self.frames_since_detection = 0
+        # Counter reset removed - now only Tier 2 resets it (in get_detection_tier)
         self.has_active_tracks = num_tracks > 0
 
     def get_stats(self) -> dict:

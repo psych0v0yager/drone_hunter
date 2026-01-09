@@ -242,13 +242,18 @@ def run_simulation(
                     track_detections = tiny_detector.detect_at_roi(frame, pred_x, pred_y)
                     detections.extend(track_detections)
             else:
-                # Tier 0: Skip detection, tracker will predict
-                detections = []
+                # Tier 0: Skip detection entirely
+                detections = None  # Sentinel to indicate no detection ran
             t_detect = time.time() - t0
 
             # Update tracker
             t0 = time.time()
-            confirmed_tracks = tracker.update(detections)
+            if detections is None:
+                # Tier 0: Just advance predictions, don't penalize tracks
+                confirmed_tracks = tracker.predict_only()
+            else:
+                # Tier 1/2: Full update with detection verification
+                confirmed_tracks = tracker.update(detections)
             t_track = time.time() - t0
 
             # Update scheduler with track count (for has_active_tracks state)

@@ -408,6 +408,27 @@ class KalmanTracker:
         self.tracks = [t for t in self.tracks if t.misses <= self.max_age]
         return [t for t in self.tracks if t.hits >= self.min_hits]
 
+    def predict_only(self) -> List[DroneTrack]:
+        """Advance track predictions without detection verification.
+
+        Use this on Tier 0 frames when detection is skipped. Tracks advance
+        their Kalman state but aren't penalized for missing detections
+        (since we didn't run any detection to verify against).
+
+        Returns:
+            List of confirmed tracks (hits >= min_hits).
+        """
+        self.frame_count += 1
+
+        for track in self.tracks:
+            track.predict()
+
+        # Don't call mark_missed() - we didn't run detection
+        # Don't create new tracks - we have no detections
+        # Don't prune tracks - misses counter unchanged
+
+        return [t for t in self.tracks if t.hits >= self.min_hits]
+
     def get_tracks_for_observation(self) -> List[DroneTrack]:
         """Get active tracks sorted by urgency (approaching tracks first)."""
         confirmed = [t for t in self.tracks if t.hits >= self.min_hits]
