@@ -24,7 +24,6 @@ from core.observation import (
     ObservationNormalizer,
     build_tracker_observation,
     build_oracle_observation,
-    compute_max_urgency,
 )
 from core.adaptive_scheduler import AdaptiveScheduler, calibrate_device
 from core.tiny_detector import TinyDetector
@@ -159,19 +158,26 @@ def run_simulation(
                     print(f"Warning: Failed to load tiny detector: {tiny_detector_path}")
 
         if adaptive_base_skip is not None:
-            scheduler = AdaptiveScheduler(base_skip=adaptive_base_skip, tiny_detector=tiny_detector)
+            # Use adaptive_base_skip as discovery_interval
+            scheduler = AdaptiveScheduler(
+                tiny_detector=tiny_detector,
+                discovery_interval=adaptive_base_skip,
+            )
             if verbose:
-                print(f"Adaptive mode enabled (base_skip={adaptive_base_skip})")
+                print(f"Adaptive mode enabled (discovery_interval={adaptive_base_skip})")
         elif detector is not None:
             # Auto-calibrate based on device speed
-            base_skip, latency_ms = calibrate_device(detector)
-            scheduler = AdaptiveScheduler(base_skip=base_skip, tiny_detector=tiny_detector)
+            discovery_interval, latency_ms = calibrate_device(detector)
+            scheduler = AdaptiveScheduler(
+                tiny_detector=tiny_detector,
+                discovery_interval=discovery_interval,
+            )
             if verbose:
-                print(f"Adaptive mode enabled (auto-calibrated: {latency_ms:.1f}ms -> base_skip={base_skip})")
+                print(f"Adaptive mode enabled (auto-calibrated: {latency_ms:.1f}ms -> discovery_interval={discovery_interval})")
         else:
-            scheduler = AdaptiveScheduler(base_skip=3, tiny_detector=tiny_detector)
+            scheduler = AdaptiveScheduler(tiny_detector=tiny_detector)
             if verbose:
-                print("Adaptive mode enabled (default base_skip=3)")
+                print("Adaptive mode enabled (default discovery_interval=10)")
 
     # Setup output directory
     if render_output and output_dir:
@@ -227,9 +233,11 @@ def run_simulation(
 
             if scheduler is not None:
                 # Adaptive mode: use scheduler to decide detection tier
-                kalman_uncertainty = tracker.get_max_uncertainty()
-                max_urg = compute_max_urgency(tracker, min_hits=obs_min_hits)
-                detection_tier = scheduler.get_detection_tier(frame, kalman_uncertainty, max_urg)
+                # v2 interface: x,y uncertainty, track count, max drone size
+                xy_uncertainty = tracker.get_max_uncertainty()
+                num_tracks = len(tracker.tracks)
+                max_size = max((max(t.bbox_size) for t in tracker.tracks), default=0.0)
+                detection_tier = scheduler.get_detection_tier(xy_uncertainty, num_tracks, max_size)
             else:
                 # Fixed interval mode
                 run_detection = (step % detect_interval == 0) or oracle_mode or detector is None
@@ -288,10 +296,6 @@ def run_simulation(
                 confirmed_tracks = tracker.update(detections if detections else [])
             t_track = time.time() - t0
 
-            # Update scheduler with track count (for has_active_tracks state)
-            if scheduler is not None and detection_tier > 0:
-                scheduler.mark_detection_complete(len(confirmed_tracks))
-
             # Build observation
             if oracle_mode:
                 obs = build_oracle_observation(
@@ -338,7 +342,7 @@ def run_simulation(
             # Collect adaptive stats
             if scheduler is not None:
                 all_stats["adaptive"]["tier_counts"][detection_tier] += 1
-                all_stats["adaptive"]["uncertainties"].append(kalman_uncertainty)
+                all_stats["adaptive"]["uncertainties"].append(xy_uncertainty)
 
             # Execute action
             reward = 0.01  # Survival reward per frame
@@ -427,7 +431,7 @@ def run_simulation(
         # Adaptive scheduler stats
         if scheduler is not None and all_stats["adaptive"]["uncertainties"]:
             print(f"\n{'=' * 50}")
-            print("ADAPTIVE SCHEDULER STATS")
+            print("ADAPTIVE SCHEDULER STATS (v2)")
             print(f"{'=' * 50}")
             tier_counts = all_stats["adaptive"]["tier_counts"]
             total_frames = sum(tier_counts.values())
@@ -437,31 +441,26 @@ def run_simulation(
             detection_rate = (tier_counts[1] + tier_counts[2]) / total_frames * 100
             print(f"Detection rate: {detection_rate:.1f}%")
 
-            # Tier 0 and Tier 2 reason breakdowns
+            # Reason breakdown (v2 uses unified tier_reasons)
             stats = scheduler.get_stats()
+            tier_reasons = stats["tier_reasons"]
+            print(f"\nDecision Breakdown:")
+            for reason, count in tier_reasons.items():
+                if count > 0:
+                    pct = count / total_frames * 100
+                    print(f"  {reason:25s}: {count:5d} ({pct:5.1f}%)")
 
-            tier0_reasons = stats["tier0_reasons"]
-            tier0_total = tier_counts[0]
-            if tier0_total > 0:
-                print(f"\nTier 0 Breakdown:")
-                for reason, count in tier0_reasons.items():
-                    if count > 0:
-                        pct = count / tier0_total * 100
-                        print(f"  {reason:20s}: {count:5d} ({pct:5.1f}%)")
-
-            tier2_reasons = stats["tier2_reasons"]
-            tier2_total = tier_counts[2]
-            if tier2_total > 0:
-                print(f"\nTier 2 Breakdown:")
-                for reason, count in tier2_reasons.items():
-                    if count > 0:
-                        pct = count / tier2_total * 100
-                        print(f"  {reason:20s}: {count:5d} ({pct:5.1f}%)")
+            # Show thresholds
+            thresholds = stats["uncertainty_thresholds"]
+            print(f"\nThresholds (ROI-relative):")
+            print(f"  Tier 0 max: {thresholds['tier0_max']:.4f}")
+            print(f"  Tier 1 max: {thresholds['tier1_max']:.4f}")
+            print(f"  Discovery interval: {stats['discovery_interval']} frames")
 
             uncertainties = all_stats["adaptive"]["uncertainties"]
-            print(f"\nUncertainty: mean={np.mean(uncertainties):.3f} "
-                  f"std={np.std(uncertainties):.3f} "
-                  f"max={np.max(uncertainties):.3f}")
+            print(f"\nX,Y Uncertainty: mean={np.mean(uncertainties):.4f} "
+                  f"std={np.std(uncertainties):.4f} "
+                  f"max={np.max(uncertainties):.4f}")
 
         print(f"{'=' * 50}")
 

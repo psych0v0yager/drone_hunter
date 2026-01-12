@@ -8,146 +8,144 @@ Detection Tiers:
 - Tier 1: Tiny detector at predicted ROI - ~2-5ms (when available)
 - Tier 2: Full NanoDet (320x320) - ~30ms
 
-Decision flow:
-1. Frame diff gate - skip if no motion
-2. Check Kalman uncertainty - full detect if high
-3. Check frames since detection - skip if under budget
-4. Otherwise tiny detect (if available) or full detect
+Key design decisions (v2 - principled thresholds):
+1. Uncertainty metric is x,y only (not z) - that's what ROI cares about
+2. Thresholds are based on ROI geometry, not empirical tuning
+3. Missed associations boost uncertainty (prevents "confident but lost")
+4. Guaranteed discovery scans every N frames (like skip-N's retry)
 """
 
 from typing import Optional, Tuple
 import time
 import numpy as np
 
-from core.motion import MotionDetector
 from core.tiny_detector import TinyDetector
 
 
-# Uncertainty thresholds (tuned via ablation_thresholds.py)
-# These are trace(P[:3,:3]) values from the Kalman filter
-# Post-detection uncertainty: ~2.9, post-skip: ~5-8
+# =============================================================================
+# ROI Geometry Constants
+# =============================================================================
+# Tier 1 uses a 40x40 ROI on a 320x320 frame
+TIER1_ROI_SIZE = 40 / 320           # 0.125 normalized
+TIER1_ROI_RADIUS = TIER1_ROI_SIZE / 2  # 0.0625 - half the ROI width
+
+# Size limits for Tier 1 viability
+# NanoDet bboxes are typically 0.10-0.20 (max of w,h)
+# The 40x40 ROI (0.125 normalized) will partially crop larger drones,
+# but the tiny detector can still work if enough of the drone is visible.
+# Setting threshold at 0.18 to allow Tier 1 for most drones.
+TIER1_MAX_DRONE_SIZE = 0.18   # Drone too big for 40x40 ROI (typically 0.10-0.20)
+TIER1_MIN_DRONE_SIZE = 0.015  # Drone too small for tiny detector accuracy
+
+# =============================================================================
+# Uncertainty Thresholds (calibrated from empirical distribution)
+# =============================================================================
+# The uncertainty metric is sqrt(P[x,x] + P[y,y]) - the x,y position standard
+# deviation from the Kalman covariance matrix.
 #
-# Calibrated from actual simulation data (50 episodes):
-#   50th percentile: 1.56
-#   75th percentile: 11.73
-#   95th percentile: 33.31
-#   max: 103.48
+# Empirical distribution (from simulation with 70% detection rate):
+#   25th percentile: 0.12 (just after Kalman update)
+#   50th percentile: 0.13
+#   75th percentile: 0.22 (after a few prediction-only frames)
+#   95th percentile: 0.37 (after many consecutive skips)
 #
-# Decision table (see _decide_tier for full logic):
-# | Uncertainty Range         | No Motion    | Has Motion   |
-# |---------------------------|--------------|--------------|
-# | < VERY_LOW (0.1)          | Tier 0 skip  | Tier 0 skip  |
-# | VERY_LOW - LOW (0.1-1)    | Tier 0 skip  | Tier 1 tiny  |
-# | LOW - MEDIUM (1-15)       | Tier 1 tiny  | Tier 1 tiny  |
-# | MEDIUM - HIGH (15-40)     | Tier 1 tiny  | Tier 2 full  |
-# | > HIGH (40+)              | Tier 2 full  | Tier 2 full  |
-UNCERTAINTY_VERY_LOW = 0.1
-UNCERTAINTY_LOW = 0.5      # Reduced: more Tier 1 instead of Tier 0
-UNCERTAINTY_MEDIUM = 8.0   # Reduced: more Tier 1 instead of skip
-UNCERTAINTY_HIGH = 40.0    # ~95th percentile
+# Thresholds chosen to match distribution percentiles:
+UNCERTAINTY_TIER0_MAX = 0.20   # Confident, safe to skip
+UNCERTAINTY_TIER1_MAX = 0.35   # Moderate uncertainty, use tiny detector if drone fits
+# Above TIER1_MAX -> use Tier 2 (high uncertainty, need full detection)
+
+# Guaranteed discovery interval (like skip-N's unconditional retry)
+DISCOVERY_INTERVAL = 10  # Max frames between Tier 2 scans
 
 
 class AdaptiveScheduler:
     """Adaptive scheduler for hierarchical detection.
 
     Decides which detection tier to use based on:
-    - Motion detection (frame differencing)
-    - Kalman filter uncertainty
-    - Time since last detection (staleness)
-    - Hardware calibration (base_skip)
+    - Kalman filter x,y prediction uncertainty
+    - Drone size (too big/small for Tier 1 ROI)
+    - Guaranteed discovery interval (periodic Tier 2 scans)
+
+    v2 Changes:
+    - Removed motion detector (uncertainty metric now captures drift)
+    - Thresholds based on ROI geometry, not empirical tuning
+    - Guaranteed discovery scans prevent indefinite skipping
     """
 
     def __init__(
         self,
-        base_skip: int = 3,
         tiny_detector: Optional[TinyDetector] = None,
-        motion_threshold: float = 5.0,
-        uncertainty_very_low: float = UNCERTAINTY_VERY_LOW,
-        uncertainty_low: float = UNCERTAINTY_LOW,
-        uncertainty_medium: float = UNCERTAINTY_MEDIUM,
-        uncertainty_high: float = UNCERTAINTY_HIGH,
+        discovery_interval: int = DISCOVERY_INTERVAL,
+        uncertainty_tier0_max: float = UNCERTAINTY_TIER0_MAX,
+        uncertainty_tier1_max: float = UNCERTAINTY_TIER1_MAX,
     ):
         """Initialize adaptive scheduler.
 
         Args:
-            base_skip: Minimum frames between detections (hardware dependent).
-                Set via calibrate_device() or manually based on device speed.
             tiny_detector: Optional TinyDetector for Tier 1 detection.
-            motion_threshold: Threshold for motion detection (default 5.0).
-            uncertainty_very_low: Below this, skip even with motion.
-            uncertainty_low: Below this, use tiny detector (if motion) or skip.
-            uncertainty_medium: Below this with motion, use Tier 1 instead of Tier 2.
-            uncertainty_high: Above this, always use Tier 2 (full detection).
+            discovery_interval: Max frames between Tier 2 scans (default 10).
+            uncertainty_tier0_max: Max uncertainty for Tier 0 (default ~0.019).
+            uncertainty_tier1_max: Max uncertainty for Tier 1 (default ~0.050).
         """
-        self.base_skip = base_skip
         self.tiny_detector = tiny_detector
-        self.motion_detector = MotionDetector(threshold=motion_threshold)
-
-        self.uncertainty_very_low = uncertainty_very_low
-        self.uncertainty_low = uncertainty_low
-        self.uncertainty_medium = uncertainty_medium
-        self.uncertainty_high = uncertainty_high
+        self.discovery_interval = discovery_interval
+        self.uncertainty_tier0_max = uncertainty_tier0_max
+        self.uncertainty_tier1_max = uncertainty_tier1_max
 
         # State
-        self.frames_since_detection = 0
+        self.frames_since_tier2 = 0
         self.last_tier = 0
-        self.has_active_tracks = False  # Must do full detect to discover drones
 
         # Statistics
         self.tier_counts = {0: 0, 1: 0, 2: 0}
-        self.tier0_reasons = {
-            "no_tracks_budget": 0,    # Rule 0: No tracks, under budget
-            "no_tracks_no_motion": 0, # Rule 0: No tracks, no motion
-            "under_budget": 0,        # Rule 3: Under budget
-            "very_low_uncert": 0,     # Rule 4: Very low uncertainty
-            "low_uncert_no_motion": 0,# Rule 5: Low uncertainty, no motion
-        }
-        self.tier2_reasons = {
-            "no_tracks": 0,      # Rule 0: No active tracks, need to discover
-            "high_uncertainty": 0,  # Rule 1: Uncertainty > 8.0
-            "staleness": 0,      # Rule 2: Too long since last detection
-            "motion_medium": 0,  # Rule 6: Medium uncertainty + motion
-            "fallback": 0,       # Tiny detector unavailable fallback
+        self.tier_reasons = {
+            # Tier 2 reasons
+            "periodic_discovery": 0,
+            "no_tracks": 0,
+            "size_exceeds_roi": 0,
+            "size_too_small": 0,
+            "uncertainty_exceeds_roi": 0,
+            "no_tiny_detector": 0,
+            # Tier 1 reasons
+            "moderate_uncertainty": 0,
+            # Tier 0 reasons
+            "confident_prediction": 0,
         }
         self.total_frames = 0
 
     def reset(self) -> None:
         """Reset scheduler state for new episode."""
-        self.frames_since_detection = 0
+        self.frames_since_tier2 = 0
         self.last_tier = 0
-        self.motion_detector.reset()
 
     def reset_stats(self) -> None:
         """Reset statistics counters."""
         self.tier_counts = {0: 0, 1: 0, 2: 0}
-        self.tier0_reasons = {
-            "no_tracks_budget": 0,
-            "no_tracks_no_motion": 0,
-            "under_budget": 0,
-            "very_low_uncert": 0,
-            "low_uncert_no_motion": 0,
-        }
-        self.tier2_reasons = {
+        self.tier_reasons = {
+            "periodic_discovery": 0,
             "no_tracks": 0,
-            "high_uncertainty": 0,
-            "staleness": 0,
-            "motion_medium": 0,
-            "fallback": 0,
+            "size_exceeds_roi": 0,
+            "size_too_small": 0,
+            "uncertainty_exceeds_roi": 0,
+            "no_tiny_detector": 0,
+            "moderate_uncertainty": 0,
+            "confident_prediction": 0,
         }
         self.total_frames = 0
 
     def get_detection_tier(
         self,
-        frame: np.ndarray,
-        kalman_uncertainty: float,
-        max_urgency: float = 0.0,
+        xy_uncertainty: float,
+        num_tracks: int,
+        max_size: float = 0.0,
     ) -> int:
         """Decide which detection tier to use.
 
         Args:
-            frame: Current frame (H, W, 3) uint8 RGB.
-            kalman_uncertainty: Scalar uncertainty from tracker.get_max_uncertainty().
-            max_urgency: Maximum urgency across tracks (0-1). High urgency = close diving drone.
+            xy_uncertainty: X,Y prediction uncertainty from tracker.get_max_uncertainty().
+                This is sqrt(x_var + y_var) in normalized screen units.
+            num_tracks: Number of active tracks.
+            max_size: Largest drone size (normalized bbox dimension).
 
         Returns:
             Detection tier:
@@ -156,156 +154,90 @@ class AdaptiveScheduler:
             - 2: Full NanoDet detection
         """
         self.total_frames += 1
-        self.frames_since_detection += 1
+        self.frames_since_tier2 += 1
 
-        # CRITICAL: Force T2 when urgency is high (close diving drones)
-        # T1's small 40x40 ROI can't capture large close targets
-        if max_urgency > 0.6:
-            self.tier_counts[2] += 1
-            self.tier2_reasons["high_urgency"] = self.tier2_reasons.get("high_urgency", 0) + 1
-            self.frames_since_detection = 0
-            self.last_tier = 2
-            return 2
+        # Core decision logic
+        tier, reason = self._decide_tier(xy_uncertainty, num_tracks, max_size)
 
-        # Check motion
-        has_motion, motion_score = self.motion_detector.detect_motion(frame)
-
-        # Decision logic
-        tier = self._decide_tier(has_motion, kalman_uncertainty)
-
-        # Update state if we're doing full detection
-        # Only Tier 2 can discover NEW drones, so only Tier 2 resets staleness counter
-        # Tier 1 only looks at existing track ROIs, can't find new threats
+        # Only Tier 2 resets discovery counter
         if tier == 2:
-            self.frames_since_detection = 0
+            self.frames_since_tier2 = 0
 
         self.last_tier = tier
         self.tier_counts[tier] += 1
+        self.tier_reasons[reason] += 1
 
         return tier
 
-    def _decide_tier(self, has_motion: bool, uncertainty: float) -> int:
+    def _decide_tier(
+        self,
+        xy_uncertainty: float,
+        num_tracks: int,
+        max_size: float,
+    ) -> Tuple[int, str]:
         """Core tier decision logic.
 
-        New tiered logic (v2):
-        | Uncertainty     | No Motion      | Has Motion     |
-        |-----------------|----------------|----------------|
-        | < 2.0 (v.low)   | Tier 0 (skip)  | Tier 0 (skip)  |
-        | 2.0-5.0 (low)   | Tier 0 (skip)  | Tier 1 (tiny)  |
-        | 5.0-8.0 (med)   | Tier 1 (tiny)  | Tier 2 (full)  |
-        | > 8.0 (high)    | Tier 2 (full)  | Tier 2 (full)  |
+        Principled decision tree based on ROI geometry:
 
-        Special case: No active tracks → must use Tier 2 to discover drones
-        (Tier 1 needs predicted ROI location from existing tracks)
+        | Condition                      | Tier | Reason                  |
+        |--------------------------------|------|-------------------------|
+        | frames_since_tier2 >= interval | 2    | periodic_discovery      |
+        | num_tracks == 0                | 2    | no_tracks               |
+        | max_size > TIER1_MAX           | 2    | size_exceeds_roi        |
+        | max_size < TIER1_MIN           | 2    | size_too_small          |
+        | uncertainty > TIER1_MAX        | 2    | uncertainty_exceeds_roi |
+        | uncertainty > TIER0_MAX        | 1    | moderate_uncertainty    |
+        | otherwise                      | 0    | confident_prediction    |
 
         Args:
-            has_motion: True if motion detected in frame.
-            uncertainty: Kalman uncertainty value.
+            xy_uncertainty: X,Y prediction uncertainty (normalized screen units).
+            num_tracks: Number of active tracks.
+            max_size: Largest drone size (normalized).
 
         Returns:
-            Detection tier (0, 1, or 2).
+            Tuple of (tier, reason_string).
         """
-        has_tiny = self.tiny_detector and self.tiny_detector.enabled
+        has_tiny = self.tiny_detector is not None and self.tiny_detector.enabled
 
-        # Rule 0: No tracks = need full detection to discover drones
-        # (Tier 1 can only confirm existing tracks, not find new ones)
-        if not self.has_active_tracks:
-            # Still respect budget to avoid spamming when scene is empty
-            if self.frames_since_detection < self.base_skip:
-                self.tier0_reasons["no_tracks_budget"] += 1
-                return 0
-            # Check for new drones if motion or been a while
-            if has_motion or self.frames_since_detection > self.base_skip * 3:
-                self.tier2_reasons["no_tracks"] += 1
-                return 2
-            self.tier0_reasons["no_tracks_no_motion"] += 1
-            return 0  # No motion, no tracks = nothing happening
+        # Rule 0: UNCONDITIONAL periodic discovery (like skip-N's retry guarantee)
+        # This breaks the feedback loop that caused adaptive mode to fail
+        if self.frames_since_tier2 >= self.discovery_interval:
+            return 2, "periodic_discovery"
 
-        # Rule 1: High uncertainty - use Tier 1 if available to refresh tracks
-        # Only use Tier 2 if no tiny detector
-        if uncertainty > self.uncertainty_high:
-            has_tiny = self.tiny_detector and self.tiny_detector.enabled
+        # Rule 1: No tracks - must discover new drones
+        # Tier 1 can only confirm existing tracks, not find new ones
+        if num_tracks == 0:
+            return 2, "no_tracks"
+
+        # Rule 2: Large drones exceed Tier 1 ROI (40x40 can't capture them)
+        if max_size > TIER1_MAX_DRONE_SIZE:
+            return 2, "size_exceeds_roi"
+
+        # Rule 3: Tiny drones need full resolution for accurate detection
+        if 0 < max_size < TIER1_MIN_DRONE_SIZE:
+            return 2, "size_too_small"
+
+        # Rule 4: High uncertainty - drone likely outside ROI
+        if xy_uncertainty > self.uncertainty_tier1_max:
+            return 2, "uncertainty_exceeds_roi"
+
+        # Rule 5: Medium uncertainty - use Tier 1 if available
+        if xy_uncertainty > self.uncertainty_tier0_max:
             if has_tiny:
-                # Tier 1 can refresh existing tracks cheaply
-                return 1
-            self.tier2_reasons["high_uncertainty"] += 1
-            return 2
-
-        # Rule 2: Staleness check - periodic full detect to catch new drones
-        if self.frames_since_detection > self.base_skip * 5:
-            self.tier2_reasons["staleness"] += 1
-            return 2
-
-        # Rule 3: Under budget - skip unless uncertainty warrants Tier 1
-        if self.frames_since_detection < self.base_skip:
-            # Allow Tier 1 even under budget if uncertainty is medium+
-            # This helps on slow devices with high base_skip
-            if uncertainty > self.uncertainty_low and has_tiny:
-                return 1
-            self.tier0_reasons["under_budget"] += 1
-            return 0
-
-        # Rule 4: Very low uncertainty = skip (track is solid)
-        if uncertainty < self.uncertainty_very_low:
-            self.tier0_reasons["very_low_uncert"] += 1
-            return 0
-
-        # Rule 5: Low uncertainty (0.1-1.0)
-        if uncertainty < self.uncertainty_low:
-            if has_motion:
-                if has_tiny:
-                    return 1
-                else:
-                    self.tier2_reasons["fallback"] += 1
-                    return 2
+                return 1, "moderate_uncertainty"
             else:
-                self.tier0_reasons["low_uncert_no_motion"] += 1
-                return 0  # No motion, skip
+                return 2, "no_tiny_detector"
 
-        # Rule 6: Medium uncertainty (LOW to HIGH)
-        # Split: below MEDIUM (25) use Tier 1 even with motion
-        #        above MEDIUM use Tier 2 with motion
-        if has_motion:
-            if uncertainty < self.uncertainty_medium:
-                # Lower-medium: Tier 1 is sufficient
-                if has_tiny:
-                    return 1
-                else:
-                    self.tier2_reasons["fallback"] += 1
-                    return 2
-            else:
-                # Upper-medium: need full detection
-                self.tier2_reasons["motion_medium"] += 1
-                return 2
-        else:
-            if has_tiny:
-                return 1
-            else:
-                self.tier2_reasons["fallback"] += 1
-                return 2
-
-    def mark_detection_complete(self, num_tracks: int = 0) -> None:
-        """Update track state after detection.
-
-        NOTE: Does NOT reset frames_since_detection - that's now handled
-        internally in get_detection_tier() to only reset for Tier 2
-        (full detection that can discover new drones).
-
-        Args:
-            num_tracks: Number of active tracks after this detection.
-        """
-        # Counter reset removed - now only Tier 2 resets it (in get_detection_tier)
-        self.has_active_tracks = num_tracks > 0
+        # Rule 6: Low uncertainty - safe to skip, predictions are reliable
+        return 0, "confident_prediction"
 
     def get_stats(self) -> dict:
         """Get scheduling statistics.
 
         Returns:
-            Dict with tier counts, percentages, and detection rate.
+            Dict with tier counts, percentages, and reason breakdown.
         """
         total = max(1, self.total_frames)
-        tier0_total = max(1, self.tier_counts[0])
-        tier2_total = max(1, self.tier_counts[2])
         return {
             "total_frames": self.total_frames,
             "tier_counts": self.tier_counts.copy(),
@@ -314,13 +246,14 @@ class AdaptiveScheduler:
             },
             "detection_rate": (self.tier_counts[1] + self.tier_counts[2]) / total * 100,
             "skip_rate": self.tier_counts[0] / total * 100,
-            "tier0_reasons": self.tier0_reasons.copy(),
-            "tier0_reason_percentages": {
-                k: v / tier0_total * 100 for k, v in self.tier0_reasons.items()
+            "tier_reasons": self.tier_reasons.copy(),
+            "tier_reason_percentages": {
+                k: v / max(1, v) * 100 for k, v in self.tier_reasons.items()
             },
-            "tier2_reasons": self.tier2_reasons.copy(),
-            "tier2_reason_percentages": {
-                k: v / tier2_total * 100 for k, v in self.tier2_reasons.items()
+            "discovery_interval": self.discovery_interval,
+            "uncertainty_thresholds": {
+                "tier0_max": self.uncertainty_tier0_max,
+                "tier1_max": self.uncertainty_tier1_max,
             },
         }
 
@@ -329,17 +262,17 @@ def calibrate_device(
     detector,
     num_iterations: int = 10,
 ) -> Tuple[int, float]:
-    """Calibrate base_skip based on device detection latency.
+    """Calibrate discovery_interval based on device detection latency.
 
     Runs detector on dummy frames and measures average latency.
-    Returns recommended base_skip for this device.
+    Returns recommended discovery_interval for this device.
 
     Args:
         detector: NanoDetDetector instance.
         num_iterations: Number of warmup/timing iterations.
 
     Returns:
-        Tuple of (base_skip, detection_latency_ms).
+        Tuple of (discovery_interval, detection_latency_ms).
     """
     # Create dummy frame
     dummy_frame = np.random.randint(0, 255, (320, 320, 3), dtype=np.uint8)
@@ -358,50 +291,47 @@ def calibrate_device(
     detection_latency = np.mean(times)
     detection_latency_ms = detection_latency * 1000
 
-    # Determine base_skip from latency
-    # Goal: ~30 FPS total, so detection should be ~33ms budget
-    # If detection takes 30ms, we can detect every frame
-    # If detection takes 100ms, we need to skip 2-3 frames
+    # Determine discovery_interval from latency
+    # Faster devices can do more frequent discovery scans
     if detection_latency < 0.020:  # 20ms - fast device
-        base_skip = 1
+        discovery_interval = 5
     elif detection_latency < 0.035:  # 35ms - medium-fast
-        base_skip = 2
+        discovery_interval = 8
     elif detection_latency < 0.050:  # 50ms - medium
-        base_skip = 3
+        discovery_interval = 10
     elif detection_latency < 0.080:  # 80ms - medium-slow
-        base_skip = 4
+        discovery_interval = 12
     else:  # > 80ms - slow device
-        base_skip = 5
+        discovery_interval = 15
 
-    return base_skip, detection_latency_ms
+    return discovery_interval, detection_latency_ms
 
 
 def create_adaptive_scheduler(
     detector=None,
     tiny_detector_path: Optional[str] = None,
     auto_calibrate: bool = True,
-    base_skip: Optional[int] = None,
+    discovery_interval: Optional[int] = None,
 ) -> AdaptiveScheduler:
     """Factory function to create configured AdaptiveScheduler.
 
     Args:
         detector: NanoDetDetector for calibration (optional).
         tiny_detector_path: Path to tiny detector ONNX (optional).
-        auto_calibrate: If True and detector provided, calibrate base_skip.
-        base_skip: Manual base_skip override.
+        auto_calibrate: If True and detector provided, calibrate discovery_interval.
+        discovery_interval: Manual discovery_interval override.
 
     Returns:
         Configured AdaptiveScheduler instance.
     """
-    # Determine base_skip
-    if base_skip is not None:
-        skip = base_skip
-        latency_ms = None
+    # Determine discovery_interval
+    if discovery_interval is not None:
+        interval = discovery_interval
     elif auto_calibrate and detector is not None:
-        skip, latency_ms = calibrate_device(detector)
-        print(f"Device calibration: {latency_ms:.1f}ms/detection -> base_skip={skip}")
+        interval, latency_ms = calibrate_device(detector)
+        print(f"Device calibration: {latency_ms:.1f}ms/detection -> discovery_interval={interval}")
     else:
-        skip = 3  # Safe default
+        interval = DISCOVERY_INTERVAL  # Default from constants
 
     # Load tiny detector if provided
     tiny = None
@@ -412,4 +342,4 @@ def create_adaptive_scheduler(
         else:
             tiny = None
 
-    return AdaptiveScheduler(base_skip=skip, tiny_detector=tiny)
+    return AdaptiveScheduler(tiny_detector=tiny, discovery_interval=interval)

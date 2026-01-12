@@ -160,24 +160,21 @@ class DroneTrack:
     ], dtype=np.float32))
 
     # Process noise (model uncertainty)
-    # Higher vz noise allows faster adaptation to approaching drones
-    # Critical: vz was stuck near 0, causing 79%->66% wrong-sign estimates
-    # Increasing further to 0.05 for even faster vz adaptation
+    # Original values from six-state-kalman branch
     Q: np.ndarray = field(default_factory=lambda: np.array([
         [0.001, 0, 0, 0, 0, 0],      # x position noise
         [0, 0.001, 0, 0, 0, 0],      # y position noise
         [0, 0, 0.01, 0, 0, 0],       # z position noise (depth less certain)
         [0, 0, 0, 0.005, 0, 0],      # vx noise
         [0, 0, 0, 0, 0.005, 0],      # vy noise
-        [0, 0, 0, 0, 0, 0.05],       # vz noise (50x original - sweet spot)
+        [0, 0, 0, 0, 0, 0.001],      # vz noise
     ], dtype=np.float32))
 
     # Measurement noise (sensor uncertainty)
-    # Reduced z noise to trust depth measurements more (faster vz convergence)
     R: np.ndarray = field(default_factory=lambda: np.array([
         [0.01, 0, 0],     # x measurement variance
         [0, 0.01, 0],     # y measurement variance
-        [0, 0, 0.02],     # z measurement variance (reduced from 0.05)
+        [0, 0, 0.05],     # z measurement variance (depth estimation)
     ], dtype=np.float32))
 
     @property
@@ -224,6 +221,14 @@ class DroneTrack:
         """Predict next state using constant velocity model."""
         self.state = self.F @ self.state
         self.P = self.F @ self.P @ self.F.T + self.Q
+
+        # Cap position variance to prevent unbounded growth
+        # Velocity uncertainty propagates into position each step (x' = x + vx)
+        # Without cap, uncertainty explodes during long prediction-only sequences
+        MAX_POSITION_VARIANCE = 0.25  # sqrt(0.25+0.25) = 0.71
+        self.P[0, 0] = min(self.P[0, 0], MAX_POSITION_VARIANCE)
+        self.P[1, 1] = min(self.P[1, 1], MAX_POSITION_VARIANCE)
+
         self.age += 1
         return self.state
 
@@ -259,28 +264,58 @@ class DroneTrack:
         self.confidence = min(1.0, self.confidence + 0.1)
 
     def mark_missed(self) -> None:
-        """Mark this track as having missed a detection."""
+        """Mark this track as having missed a detection.
+
+        When a track fails to associate with any detection, we boost the
+        x,y covariance to signal uncertainty to the adaptive scheduler.
+        This prevents the "confident but lost" failure mode where a track
+        appears healthy (low uncertainty) but is actually at the wrong position.
+        """
         self.misses += 1
         self.hits = 0
         self.confidence = max(0.0, self.confidence - 0.2)
+
+        # Boost x,y covariance when association fails
+        # This signals to scheduler that we may have lost track
+        # Cap prevents exponential growth that would saturate uncertainty
+        MISS_UNCERTAINTY_BOOST = 1.5
+        MAX_POSITION_VARIANCE = 0.05  # sqrt(0.05+0.05) = 0.32, just above tier1 threshold (0.30)
+        self.P[0, 0] = min(self.P[0, 0] * MISS_UNCERTAINTY_BOOST, MAX_POSITION_VARIANCE)
+        self.P[1, 1] = min(self.P[1, 1] * MISS_UNCERTAINTY_BOOST, MAX_POSITION_VARIANCE)
 
     def get_position_uncertainty(self) -> float:
         """Scalar uncertainty from position covariance.
 
         Returns the trace of the position submatrix of P (x, y, z variances).
         Higher values indicate less certainty about the track's position.
-        Used by adaptive scheduler to decide when to run detection.
+
+        DEPRECATED: Use get_xy_prediction_uncertainty() for adaptive scheduling.
+        This method includes z variance which dominates due to higher process
+        noise, but the Tier 1 ROI only cares about x,y screen position.
         """
         return float(np.trace(self.P[:3, :3]))
+
+    def get_xy_uncertainty(self) -> float:
+        """Current x,y position uncertainty from Kalman covariance.
+
+        Only measures screen position uncertainty (x,y), not depth (z).
+        This is used by the adaptive scheduler to decide detection tier.
+
+        Returns:
+            sqrt(P[x,x] + P[y,y]) - the x,y position standard deviation
+        """
+        xy_variance = self.P[0, 0] + self.P[1, 1]
+        # Guard against numerical precision issues causing negative variance
+        xy_variance = max(0.0, xy_variance)
+        return float(np.sqrt(xy_variance))
 
 
 class KalmanTracker:
     """Multi-object tracker using Kalman filters for depth estimation."""
 
     # Depth calibration: z = REFERENCE_Z * (REFERENCE_HEIGHT / bbox_height)
-    # Calibrated from simulation data where NanoDet bbox matches ground truth (0.99x)
-    # but z estimates were -0.334 too close. Adjusted from 0.03 to 0.044.
-    REFERENCE_HEIGHT: float = 0.044
+    # Original values from six-state-kalman branch
+    REFERENCE_HEIGHT: float = 0.03
     REFERENCE_Z: float = 0.5
 
     def __init__(
@@ -496,15 +531,18 @@ class KalmanTracker:
         return sorted(confirmed, key=lambda t: -urgency(t))
 
     def get_max_uncertainty(self) -> float:
-        """Get highest uncertainty across all tracks.
+        """Get highest x,y uncertainty across all tracks.
 
         Returns 1.0 if no tracks exist (high uncertainty = need detection).
         Used by adaptive scheduler to trigger detection when prediction
         confidence is low.
+
+        Returns:
+            Maximum x,y uncertainty in normalized screen units.
         """
         if not self.tracks:
             return 1.0  # No tracks = high uncertainty, need detection
-        return max(t.get_position_uncertainty() for t in self.tracks)
+        return max(t.get_xy_uncertainty() for t in self.tracks)
 
     def get_mean_uncertainty(self) -> float:
         """Get mean uncertainty across all tracks.
