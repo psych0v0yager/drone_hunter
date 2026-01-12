@@ -268,11 +268,9 @@ def run_simulation(
                     pred_x, pred_y = track.center
                     track_detections = tiny_detector.detect_at_roi(frame, pred_x, pred_y)
 
-                    # Clamp detection bbox to be within 2x of track's bbox
-                    # This prevents IoU failure from tiny detector's different bbox scale
-                    # (tiny detector outputs bbox sizes up to 3x different from NanoDet)
+                    # Clamp detection bbox to be within reasonable range of track's bbox
                     for det in track_detections:
-                        min_scale, max_scale = 0.7, 1.4  # Tightened to reduce T1 bbox divergence
+                        min_scale, max_scale = 0.7, 1.4
                         det.w = float(np.clip(det.w, track.bbox_size[0] * min_scale,
                                                      track.bbox_size[0] * max_scale))
                         det.h = float(np.clip(det.h, track.bbox_size[1] * min_scale,
