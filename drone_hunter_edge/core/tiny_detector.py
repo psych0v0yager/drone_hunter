@@ -32,7 +32,7 @@ class TinyDetector:
         self,
         model_path: Optional[str] = None,
         roi_size: int = 40,
-        conf_threshold: float = 0.90,  # High threshold - model outputs 0.95-1.0 for real drones
+        conf_threshold: float = 0.70,  # Higher threshold for more selective detection
     ):
         """Initialize tiny detector.
 
@@ -80,6 +80,11 @@ class TinyDetector:
             self.input_name = self.session.get_inputs()[0].name
             self.output_name = self.session.get_outputs()[0].name
 
+            # Infer roi_size from model input shape
+            input_shape = self.session.get_inputs()[0].shape
+            if len(input_shape) == 4 and input_shape[2] == input_shape[3]:
+                self.roi_size = input_shape[2]
+
             return True
 
         except Exception as e:
@@ -95,6 +100,8 @@ class TinyDetector:
     ) -> Tuple[np.ndarray, int, int]:
         """Crop ROI from frame around predicted center.
 
+        Clamps ROI to frame bounds (no padding) to match training data.
+
         Args:
             frame: Full frame (H, W, 3) uint8 RGB.
             center_x: ROI center x (normalized 0-1).
@@ -102,7 +109,7 @@ class TinyDetector:
 
         Returns:
             Tuple of (cropped_roi, x_offset, y_offset) where offsets
-            are in pixels for converting back to full-frame coords.
+            are the top-left corner in pixels.
         """
         h, w = frame.shape[:2]
 
@@ -112,22 +119,25 @@ class TinyDetector:
 
         # Compute ROI bounds (centered on prediction)
         half_size = self.roi_size // 2
-        x_min = max(0, cx_px - half_size)
-        y_min = max(0, cy_px - half_size)
-        x_max = min(w, cx_px + half_size)
-        y_max = min(h, cy_px + half_size)
+        x1 = cx_px - half_size
+        y1 = cy_px - half_size
+        x2 = x1 + self.roi_size
+        y2 = y1 + self.roi_size
 
-        # Crop ROI
-        roi = frame[y_min:y_max, x_min:x_max]
+        # Clamp ROI to frame bounds (no padding - matches training)
+        if x1 < 0:
+            x1, x2 = 0, self.roi_size
+        if y1 < 0:
+            y1, y2 = 0, self.roi_size
+        if x2 > w:
+            x1, x2 = w - self.roi_size, w
+        if y2 > h:
+            y1, y2 = h - self.roi_size, h
 
-        # Pad if necessary (when near edges)
-        if roi.shape[0] < self.roi_size or roi.shape[1] < self.roi_size:
-            padded = np.zeros((self.roi_size, self.roi_size, 3), dtype=np.uint8)
-            ph, pw = roi.shape[:2]
-            padded[:ph, :pw] = roi
-            roi = padded
+        # Crop ROI (guaranteed to be full size)
+        roi = frame[y1:y2, x1:x2]
 
-        return roi, x_min, y_min
+        return roi, x1, y1
 
     def _preprocess(self, roi: np.ndarray) -> np.ndarray:
         """Preprocess ROI for inference.

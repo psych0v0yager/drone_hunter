@@ -27,7 +27,7 @@ from drone_hunter.envs.renderer import SpriteRenderer
 def create_random_drone(
     x_range: Tuple[float, float] = (0.1, 0.9),
     y_range: Tuple[float, float] = (0.1, 0.9),
-    z_range: Tuple[float, float] = (0.2, 0.9),
+    z_range: Tuple[float, float] = (0.1, 0.9),  # Include close drones (up to ~100px)
 ) -> Drone:
     """Create a drone with random position."""
     drone_type = random.choice([DroneType.NORMAL, DroneType.KAMIKAZE, DroneType.ERRATIC])
@@ -178,26 +178,22 @@ def generate_positive_sample(
     x2 = x1 + roi_size
     y2 = y1 + roi_size
 
-    # Handle frame edge cases (pad if outside frame)
-    pad_left = max(0, -x1)
-    pad_top = max(0, -y1)
-    pad_right = max(0, x2 - frame_w)
-    pad_bottom = max(0, y2 - frame_h)
+    # Clamp ROI to frame bounds (no black padding - matches inference)
+    if x1 < 0:
+        x1, x2 = 0, roi_size
+    if y1 < 0:
+        y1, y2 = 0, roi_size
+    if x2 > frame_w:
+        x1, x2 = frame_w - roi_size, frame_w
+    if y2 > frame_h:
+        y1, y2 = frame_h - roi_size, frame_h
 
-    x1_clamped = max(0, x1)
-    y1_clamped = max(0, y1)
-    x2_clamped = min(frame_w, x2)
-    y2_clamped = min(frame_h, y2)
+    # Recalculate target position based on clamped ROI
+    target_cx = (drone_x_px - x1) / roi_size
+    target_cy = (drone_y_px - y1) / roi_size
 
-    # Crop
-    roi = frame[y1_clamped:y2_clamped, x1_clamped:x2_clamped].copy()
-
-    # Pad if necessary (when crop extends outside frame)
-    if pad_left > 0 or pad_top > 0 or pad_right > 0 or pad_bottom > 0:
-        padded = np.zeros((roi_size, roi_size, 3), dtype=np.uint8)
-        ph, pw = roi.shape[:2]
-        padded[pad_top:pad_top+ph, pad_left:pad_left+pw] = roi
-        roi = padded
+    # Crop (guaranteed to be full size, no padding needed)
+    roi = frame[y1:y2, x1:x2].copy()
 
     # Compute drone size relative to ROI
     drone_size_px = drone.size * frame_w
@@ -268,6 +264,87 @@ def generate_hard_negative_sample(
     target = np.zeros(4, dtype=np.float32)
 
     return roi, target, False
+
+
+def generate_multi_drone_sample(
+    renderer: SpriteRenderer,
+    roi_size: int,
+    num_drones: int = 2,
+) -> Tuple[np.ndarray, np.ndarray, bool]:
+    """Generate a positive sample with multiple drones in the ROI.
+
+    This creates harder training examples where the model must detect
+    drones even when multiple are present in the same region.
+
+    Args:
+        renderer: SpriteRenderer instance.
+        roi_size: Size of ROI crop.
+        num_drones: Number of drones to place (2-4).
+
+    Returns:
+        Tuple of (roi, target, has_drone) where target is for the primary drone.
+    """
+    # Disable motion blur for crisp drone silhouettes
+    original_motion_blur = renderer.motion_blur
+    renderer.motion_blur = False
+
+    # Create game state with multiple drones
+    game_state = GameState(max_frames=1)
+    drones = [create_random_drone() for _ in range(num_drones)]
+    game_state.drones = drones
+
+    # Render
+    frame = renderer.render(game_state)
+    frame_h, frame_w = frame.shape[:2]
+
+    renderer.motion_blur = original_motion_blur
+
+    # Pick a random drone as the "primary" one we're tracking
+    primary = random.choice(drones)
+    drone_x_px = primary.x * frame_w
+    drone_y_px = primary.y * frame_h
+
+    # Pick target position for primary drone within ROI
+    target_cx = random.uniform(0.15, 0.85)
+    target_cy = random.uniform(0.15, 0.85)
+
+    # Calculate ROI crop position
+    offset_x_px = (0.5 - target_cx) * roi_size
+    offset_y_px = (0.5 - target_cy) * roi_size
+
+    crop_cx_px = int(drone_x_px + offset_x_px)
+    crop_cy_px = int(drone_y_px + offset_y_px)
+
+    half = roi_size // 2
+    x1 = crop_cx_px - half
+    y1 = crop_cy_px - half
+    x2 = x1 + roi_size
+    y2 = y1 + roi_size
+
+    # Clamp to frame bounds
+    if x1 < 0:
+        x1, x2 = 0, roi_size
+    if y1 < 0:
+        y1, y2 = 0, roi_size
+    if x2 > frame_w:
+        x1, x2 = frame_w - roi_size, frame_w
+    if y2 > frame_h:
+        y1, y2 = frame_h - roi_size, frame_h
+
+    # Recalculate target position
+    target_cx = (drone_x_px - x1) / roi_size
+    target_cy = (drone_y_px - y1) / roi_size
+
+    roi = frame[y1:y2, x1:x2].copy()
+
+    # Primary drone size
+    drone_size_px = primary.size * frame_w
+    w = drone_size_px / roi_size
+    h = drone_size_px / roi_size
+
+    target = np.array([target_cx, target_cy, w, h], dtype=np.float32)
+
+    return roi, target, True
 
 
 def generate_cloud_edge_negative_sample(
@@ -348,11 +425,12 @@ def generate_dataset(
     output_dir: str,
     difficulty: str = "medium",
     num_samples: int = 15000,
-    positive_ratio: float = 0.7,
+    positive_ratio: float = 0.5,  # 50/50 split for balanced training
     val_split: float = 0.1,
     roi_size: int = 40,
     jitter_px: int = 0,
     cloud_edge_negatives: bool = True,
+    multi_drone_ratio: float = 0.2,  # 20% of positives have multiple drones
     append: bool = False,
     seed: int = 42,
 ):
@@ -362,11 +440,12 @@ def generate_dataset(
         output_dir: Output directory for .npz files.
         difficulty: Difficulty preset (easy, medium, hard, forest, urban).
         num_samples: Total number of samples to generate.
-        positive_ratio: Fraction of positive samples.
+        positive_ratio: Fraction of positive samples (default 0.5 for balanced).
         val_split: Fraction for validation set.
         roi_size: Size of square ROI crops.
         jitter_px: Jitter for positive samples (default 0, no jitter).
         cloud_edge_negatives: Use cloud-edge sampling for hard negatives (default True).
+        multi_drone_ratio: Fraction of positives with multiple drones (default 0.2).
         append: Append to existing dataset.
         seed: Random seed.
     """
@@ -383,6 +462,8 @@ def generate_dataset(
     # Calculate sample counts
     num_positive = int(num_samples * positive_ratio)
     num_negative = num_samples - num_positive
+    num_single_drone = int(num_positive * (1 - multi_drone_ratio))
+    num_multi_drone = num_positive - num_single_drone
     num_hard_negative = num_negative // 2
     num_easy_negative = num_negative - num_hard_negative
 
@@ -390,22 +471,31 @@ def generate_dataset(
     print(f"Generating dataset:")
     print(f"  Difficulty: {difficulty}")
     print(f"  Total samples: {num_samples}")
-    print(f"  Positive: {num_positive}")
+    print(f"  Positive: {num_positive} ({num_single_drone} single, {num_multi_drone} multi-drone)")
     print(f"  Hard negative: {num_hard_negative} ({hard_neg_type})")
     print(f"  Easy negative: {num_easy_negative}")
     print(f"  ROI size: {roi_size}x{roi_size}")
-    print(f"  Jitter: ±{jitter_px}px")
 
     # Generate samples
     images = []
     targets = []
     has_drone = []
 
-    # Positive samples
-    print("\nGenerating positive samples...")
-    for _ in tqdm(range(num_positive), desc="Positive"):
-        renderer.reset_background()  # Vary background
+    # Single-drone positive samples
+    print("\nGenerating single-drone positive samples...")
+    for _ in tqdm(range(num_single_drone), desc="Single drone"):
+        renderer.reset_background()
         roi, target, label = generate_positive_sample(renderer, roi_size, jitter_px)
+        images.append(roi)
+        targets.append(target)
+        has_drone.append(label)
+
+    # Multi-drone positive samples
+    print("Generating multi-drone positive samples...")
+    for _ in tqdm(range(num_multi_drone), desc="Multi drone"):
+        renderer.reset_background()
+        num_drones = random.choice([2, 2, 2, 3, 3, 4])  # Weighted toward 2-3
+        roi, target, label = generate_multi_drone_sample(renderer, roi_size, num_drones)
         images.append(roi)
         targets.append(target)
         has_drone.append(label)
@@ -502,8 +592,10 @@ def main():
                         help="Difficulty preset")
     parser.add_argument("--num-samples", type=int, default=15000,
                         help="Total number of samples")
-    parser.add_argument("--positive-ratio", type=float, default=0.7,
-                        help="Fraction of positive samples")
+    parser.add_argument("--positive-ratio", type=float, default=0.5,
+                        help="Fraction of positive samples (default 0.5 for balanced)")
+    parser.add_argument("--multi-drone-ratio", type=float, default=0.2,
+                        help="Fraction of positives with multiple drones (default 0.2)")
     parser.add_argument("--val-split", type=float, default=0.1,
                         help="Fraction for validation")
     parser.add_argument("--roi-size", type=int, default=40,
@@ -526,6 +618,7 @@ def main():
         difficulty=args.difficulty,
         num_samples=args.num_samples,
         positive_ratio=args.positive_ratio,
+        multi_drone_ratio=args.multi_drone_ratio,
         val_split=args.val_split,
         roi_size=args.roi_size,
         jitter_px=args.jitter,

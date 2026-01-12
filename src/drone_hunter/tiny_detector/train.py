@@ -35,6 +35,7 @@ def compute_loss(
     outputs: torch.Tensor,
     targets: torch.Tensor,
     has_drone: torch.Tensor,
+    conf_weight: float = 2.0,  # Reduced from 50 to allow bbox learning
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Compute combined bbox and confidence loss.
 
@@ -42,6 +43,8 @@ def compute_loss(
         outputs: (B, 5) model outputs [cx, cy, w, h, conf].
         targets: (B, 4) ground truth [cx, cy, w, h].
         has_drone: (B,) bool mask for positive samples.
+        conf_weight: Weight for confidence loss to balance with bbox loss.
+            Default 50.0 to make conf loss ~equal to bbox loss magnitude.
 
     Returns:
         Tuple of (total_loss, loss_dict).
@@ -50,9 +53,20 @@ def compute_loss(
     pred_bbox = outputs[:, :4]  # [cx, cy, w, h]
     pred_conf = outputs[:, 4]  # confidence
 
-    # Confidence loss (all samples)
+    # Confidence loss (all samples) with class weighting
     conf_target = has_drone.float()
-    conf_loss = F.binary_cross_entropy(pred_conf, conf_target)
+    # Handle class imbalance: negatives are minority, weight them higher
+    num_pos = has_drone.sum().float().clamp(min=1)
+    num_neg = (~has_drone).sum().float().clamp(min=1)
+    neg_weight = num_pos / num_neg  # weight negatives higher since fewer of them
+
+    # BCEWithLogitsLoss would be better but we already have sigmoid in model
+    # Instead, manually weight the loss per sample
+    per_sample_loss = F.binary_cross_entropy(pred_conf, conf_target, reduction='none')
+    # Weight negative samples higher (since model tends to predict all positive)
+    sample_weights = torch.where(has_drone, torch.ones_like(per_sample_loss),
+                                  neg_weight * torch.ones_like(per_sample_loss))
+    conf_loss = (per_sample_loss * sample_weights).mean()
 
     # Bbox loss (positive samples only)
     if has_drone.any():
@@ -61,8 +75,8 @@ def compute_loss(
     else:
         bbox_loss = torch.tensor(0.0, device=outputs.device)
 
-    # Total loss
-    total_loss = bbox_loss + conf_loss
+    # Total loss - weight conf_loss to be comparable to bbox_loss
+    total_loss = bbox_loss + conf_weight * conf_loss
 
     return total_loss, {
         "total": total_loss.item(),

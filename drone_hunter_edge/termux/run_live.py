@@ -240,6 +240,11 @@ def run_live(
                             # Tighter clamping to prevent T1 boxes from being too different from T2
                             d.w = float(np.clip(d.w, trk.bbox_size[0]*0.7, trk.bbox_size[0]*1.4))
                             d.h = float(np.clip(d.h, trk.bbox_size[1]*0.7, trk.bbox_size[1]*1.4))
+                            # Debug: show position difference
+                            dx = d.x - px
+                            dy = d.y - py
+                            if abs(dx) > 0.02 or abs(dy) > 0.02:
+                                print(f"    pos: kalman=({px:.3f},{py:.3f}) det=({d.x:.3f},{d.y:.3f}) delta=({dx:.3f},{dy:.3f})")
                         detections.extend(td)
                     if detections:
                         confs = [f"{d.confidence:.2f}" for d in detections]

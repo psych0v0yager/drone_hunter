@@ -54,12 +54,14 @@ class TinyDroneNet(nn.Module):
             ])
             in_channels = out_channels
 
-        # Global average pooling
-        layers.append(nn.AdaptiveAvgPool2d(1))
+        # No GAP - keep spatial features for position learning
         self.features = nn.Sequential(*layers)
 
-        # Compute feature size after pooling
-        self.feature_size = channels[-1]
+        # Compute feature size: roi_size / 2^num_pools = spatial_size
+        # e.g., 96 / 16 = 6, so 6x6 feature map
+        num_pools = len(channels)
+        spatial_size = roi_size // (2 ** num_pools)
+        self.feature_size = channels[-1] * spatial_size * spatial_size
 
         # FC head for bbox + confidence
         self.head = nn.Sequential(
@@ -101,7 +103,8 @@ class TinyDroneNet(nn.Module):
         # Apply activations
         cx = torch.sigmoid(x[:, 0:1])
         cy = torch.sigmoid(x[:, 1:2])
-        wh = torch.exp(x[:, 2:4])  # Positive, can be > 1 for clipped drones
+        # Use sigmoid for w/h (bounded 0.05-1.0, more stable than exp)
+        wh = torch.sigmoid(x[:, 2:4]) * 0.95 + 0.05
         conf = torch.sigmoid(x[:, 4:5])
 
         return torch.cat([cx, cy, wh, conf], dim=1)
