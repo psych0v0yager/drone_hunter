@@ -32,7 +32,6 @@ from core.observation import (
     ObservationNormalizer,
     build_tracker_observation,
     build_oracle_observation,
-    compute_max_urgency,
 )
 from core.adaptive_scheduler import AdaptiveScheduler
 from core.tiny_detector import TinyDetector
@@ -86,7 +85,7 @@ def run_live(
     # Initialize adaptive scheduler
     scheduler = None
     if adaptive_mode:
-        scheduler = AdaptiveScheduler(base_skip=1, tiny_detector=tiny_detector)
+        scheduler = AdaptiveScheduler(discovery_interval=5, tiny_detector=tiny_detector)
         print("Adaptive mode enabled")
 
     # Load detector if provided
@@ -221,10 +220,11 @@ def run_live(
                     if d.is_on_screen()
                 ]
             elif adaptive_mode and scheduler:
-                # Adaptive mode: use scheduler to decide tier
-                unc = tracker.get_max_uncertainty()
-                max_urg = compute_max_urgency(tracker)
-                tier = scheduler.get_detection_tier(frame, unc, max_urg)
+                # Adaptive mode: use scheduler to decide tier (v2 interface)
+                xy_uncertainty = tracker.get_max_uncertainty()
+                num_tracks = len(tracker.tracks)
+                max_size = max((max(t.bbox_size) for t in tracker.tracks), default=0.0)
+                tier = scheduler.get_detection_tier(xy_uncertainty, num_tracks, max_size)
 
                 if tier == 2:
                     detections = detector.detect(frame)
@@ -256,8 +256,7 @@ def run_live(
             else:
                 tracks = tracker.update(detections if detections else [])
 
-            if adaptive_mode and scheduler and tier > 0:
-                scheduler.mark_detection_complete(len(tracks) if tracks else 0)
+            # Note: v2 scheduler doesn't need mark_detection_complete
             t_track = time.perf_counter() - t0
 
             # Build observation
