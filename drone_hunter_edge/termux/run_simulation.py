@@ -80,6 +80,20 @@ def run_simulation(
     tracker_max_age = 15 if adaptive_mode else 5
     tracker = KalmanTracker(max_age=tracker_max_age)
 
+    # Track maturity filter: require min_hits before including track in observation
+    # - Adaptive mode: 5 hits (T2 runs often enough to accumulate)
+    # - Skip-N mode: scale with detect_interval (can only get 1 hit per detection)
+    # Note: Skip-N passes [] on skip frames which resets hits to 0, so tracks
+    # can only accumulate ~1-2 hits between detections
+    if adaptive_mode:
+        obs_min_hits = 5  # Prevent snap firing, T2 can build up hits
+    elif detect_interval >= 5:
+        obs_min_hits = 1  # Skip 5+: tracks barely survive, require only 1 hit
+    elif detect_interval >= 3:
+        obs_min_hits = 2  # Skip 3-4: can accumulate 2 hits
+    else:
+        obs_min_hits = 3  # Skip 1-2: can accumulate more hits
+
     # Load detector if provided
     detector = None
     if detector_model and not oracle_mode:
@@ -214,7 +228,7 @@ def run_simulation(
             if scheduler is not None:
                 # Adaptive mode: use scheduler to decide detection tier
                 kalman_uncertainty = tracker.get_max_uncertainty()
-                max_urg = compute_max_urgency(tracker)
+                max_urg = compute_max_urgency(tracker, min_hits=obs_min_hits)
                 detection_tier = scheduler.get_detection_tier(frame, kalman_uncertainty, max_urg)
             else:
                 # Fixed interval mode
@@ -289,7 +303,7 @@ def run_simulation(
                     grid_size=grid_size,
                 )
             else:
-                obs = build_tracker_observation(tracker, grid_size=grid_size)
+                obs = build_tracker_observation(tracker, grid_size=grid_size, min_hits=obs_min_hits)
                 # Fill in game state values
                 obs["game_state"][0] = game_state.ammo_fraction
                 obs["game_state"][1] = game_state.reload_fraction
