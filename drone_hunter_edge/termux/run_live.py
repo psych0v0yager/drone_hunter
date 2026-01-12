@@ -228,6 +228,9 @@ def run_live(
 
                 if tier == 2:
                     detections = detector.detect(frame)
+                    if detections:
+                        confs = [f"{d.confidence:.2f}" for d in detections]
+                        print(f"  [T2 NanoDet] {len(detections)} det: {confs}")
                 elif tier == 1 and tiny_detector:
                     detections = []
                     for trk in tracker.get_tracks_for_observation():
@@ -238,6 +241,9 @@ def run_live(
                             d.w = float(np.clip(d.w, trk.bbox_size[0]*0.7, trk.bbox_size[0]*1.4))
                             d.h = float(np.clip(d.h, trk.bbox_size[1]*0.7, trk.bbox_size[1]*1.4))
                         detections.extend(td)
+                    if detections:
+                        confs = [f"{d.confidence:.2f}" for d in detections]
+                        print(f"  [T1 Tiny] {len(detections)} det: {confs}")
                 else:
                     detections = None  # Tier 0: skip
             else:

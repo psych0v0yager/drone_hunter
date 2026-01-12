@@ -32,7 +32,7 @@ class TinyDetector:
         self,
         model_path: Optional[str] = None,
         roi_size: int = 40,
-        conf_threshold: float = 0.82,  # Balanced: not too sensitive, not too strict
+        conf_threshold: float = 0.90,  # High threshold - model outputs 0.95-1.0 for real drones
     ):
         """Initialize tiny detector.
 
@@ -186,12 +186,16 @@ class TinyDetector:
         if conf < self.conf_threshold:
             return []
 
+        # Force square output - drones are square in simulation
+        # Use max to avoid undersizing (better to slightly oversize than undersize)
+        size = max(w, h)
+
         # Convert ROI-local coords to full-frame normalized coords
-        # cx, cy are 0-1 within ROI
+        # cx, cy are 0-1 within ROI (model trained with jitter to learn position)
         full_x = (x_offset + cx * self.roi_size) / frame_width
         full_y = (y_offset + cy * self.roi_size) / frame_height
-        full_w = (w * self.roi_size) / frame_width
-        full_h = (h * self.roi_size) / frame_height
+        full_w = (size * self.roi_size) / frame_width
+        full_h = (size * self.roi_size) / frame_height
 
         return [Detection(
             x=float(full_x),
