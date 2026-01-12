@@ -264,19 +264,22 @@ def run_simulation(
             elif detection_tier == 1 and tiny_detector is not None:
                 # Tier 1: Run tiny detector at each predicted track location
                 detections = []
+
                 for track in tracker.get_tracks_for_observation():
                     pred_x, pred_y = track.center
                     track_detections = tiny_detector.detect_at_roi(frame, pred_x, pred_y)
 
-                    # Clamp detection bbox to be within reasonable range of track's bbox
+                    # Add all detections - let tracker association handle matching
+                    # (removed position gating which was silently dropping valid detections)
                     for det in track_detections:
+                        # Clamp bbox size to be within reasonable range of track's bbox
                         min_scale, max_scale = 0.7, 1.4
                         det.w = float(np.clip(det.w, track.bbox_size[0] * min_scale,
                                                      track.bbox_size[0] * max_scale))
                         det.h = float(np.clip(det.h, track.bbox_size[1] * min_scale,
                                                      track.bbox_size[1] * max_scale))
 
-                    detections.extend(track_detections)
+                        detections.append(det)
             else:
                 # Tier 0: Skip detection entirely
                 detections = None  # Sentinel to indicate no detection ran
@@ -287,8 +290,12 @@ def run_simulation(
             if detections is None and scheduler is not None:
                 # Adaptive Tier 0: Just advance predictions, don't penalize tracks
                 confirmed_tracks = tracker.predict_only()
+            elif scheduler is not None and detection_tier == 1 and not detections:
+                # T1 with no detections: call update([]) to trigger mark_missed()
+                # This increases uncertainty so scheduler will trigger T2 rescue
+                confirmed_tracks = tracker.update([])
             else:
-                # Tier 1/2, or skip-N mode: Full update with detection verification
+                # Tier 2, T1 with detections, or skip-N mode: Full update
                 # Note: skip-N passes [] which penalizes tracks, but the policy
                 # was trained expecting this behavior (tracks invisible on skip frames)
                 confirmed_tracks = tracker.update(detections if detections else [])
